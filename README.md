@@ -9,10 +9,14 @@ In July 2023 I set out the key requirements for the project
 - secure
 - be cheap
 
-This system is 100% local, no external access required at all
+This system is 100% local, no external access required at all.
+
 A 2.5w 380mm x 70mm thin film flexible panel is enough to keep a 2000mah battery fully charged with less than 2 hours a day of sun. the 2000mah battery lasts about 10 days with no panel connected.
+
 Key design requirement was for the blinds to still operate by hand, so a mechanism was developed that disengages the motor from the actuator once the move command is complete. 
+
 Position is sensed using a linear potentiometer thats connected to the actualing arm, so the blinds always know their position.
+
 All data packets are AES128 encrypted and hardened against replay attacks using 1 second interval TOTP, so no-one can open your blinds but you.
 Costs are kept low by using cheap modules form china, assembled onto custom PCB's and housed in 3d printed parts.
 The wired slaves are powered by the master, thus only a single battery and solar panel per system and a significant reduction in actuator cost too. 
@@ -127,6 +131,14 @@ Your support helps me keep building and maintaining open-source projects like th
 
 - Each firmware folder contains its own README with build and usage instructions.
 - For wiring, assembly, and setup, see my videos on youtube or open an issue for help.
+
+---
+
+## ToDo
+
+- Impliment the commands for setting actuator limits
+- Impliment PWM control of motors to reduce noise
+- Self calibration features to determine stroke time and disengage time
 
 ---
 
