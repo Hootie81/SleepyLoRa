@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025 Chris Huitema
+
 #include "Command_Register.h"
 struct timeSync_t timeSyncPayload;
 struct status_t device_status;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025 Chris Huitema
+
 // Heltec - SX126x pin configuration
 int PIN_LORA_RESET = 12;
 int PIN_LORA_BUSY = 13;

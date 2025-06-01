@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025 Chris Huitema
+
 #include "webserver.h"
 #include "config.h"
 #include <WiFi.h>
