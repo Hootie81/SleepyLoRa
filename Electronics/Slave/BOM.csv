@@ -1,0 +1,8 @@
+ID,Part No,qty,link,notes
+U1 ,DRV8833 module,1,https://www.aliexpress.com/item/1005007347094702.html,6pins each side not 7
+U2,ESP32 SuperMini Development Board ESP32-C3 Development Board,1,https://www.aliexpress.com/item/1005006350465839.html,
+U3,MAX3485 unidirection module 3.3v version,1,https://www.aliexpress.com/item/1005006186051306.html,"5pins 1 side, 3 on other"
+"R1,R2, R3, R4, R5, R6",10k 1/4w resistor,6,,"1required, 2-6 optional"
+RV1,128mm B10K Single Channel Sliding Potentiometer Stroke 100mm Handle 8mm,1,https://www.aliexpress.com/item/1005005470862119.html,
+"J1, J2, J3",JST XH2.54 4 Pin Terminals Plastic Shell Male Plug ,3,https://www.aliexpress.com/item/1005003422202370.html,
+"C1, C2, C3, C4",100nf Ceramic cap 50v 0.1uf ,3,https://www.aliexpress.com/item/32971478818.html,

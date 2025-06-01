@@ -1,0 +1,12 @@
+ID,Part No,qty,link,notes
+U1 ,DRV8833 module,1,https://www.aliexpress.com/item/1005007347094702.html,6pins each side not 7
+U2,Heltec Wireless stick lite v3,1,https://www.aliexpress.com/item/1005005164155546.html,Ensure correct frequency for your area
+,915MHz FPC Antenna PCB Anteana,1,https://www.aliexpress.com/item/1005006958686850.html,5mm x 75mm version
+U3,Mini DC Boost Converter Board 3.7V to 12V Step Up Board Voltage Regulator PCB Board Electronic Voltage Module,1,https://www.aliexpress.com/item/1005006115043704.html,set to 5v output
+U4,MAX3485 unidirection module 3.3v version,1,https://www.aliexpress.com/item/1005006186051306.html,"5pins 1 side, 3 on other"
+R1,10k 1/4w resistor,1,,
+SW1,Middle 2Pin 6x6x6mm Switch Tactile Push Button ,1,https://www.aliexpress.com/item/1005005917191424.html,
+RV1,128mm B10K Single Channel Sliding Potentiometer Stroke 100mm Handle 8mm,1,https://www.aliexpress.com/item/1005005470862119.html,
+"J1, J2, J3",JST XH2.54 4 Pin Terminals Plastic Shell Male Plug ,3,https://www.aliexpress.com/item/1005003422202370.html,
+"C1, C2",100nf Ceramic cap 50v 0.1uf ,2,https://www.aliexpress.com/item/32971478818.html,
+
