@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025 Chris Huitema
+
 #include "blinds.h"
 #include <Arduino.h>
 #include <vector>

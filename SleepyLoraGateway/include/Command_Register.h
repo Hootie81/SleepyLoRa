@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025 Chris Huitema
+
 #include <stdint.h>
 #define TIME_SYNC_COMMAND 0xBB
 #define ACK             0xAA

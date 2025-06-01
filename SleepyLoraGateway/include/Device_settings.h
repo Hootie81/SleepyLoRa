@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025 Chris Huitema
+
 #define OTP_RANGE 5             // max time difference allowed for valid OTP, must be less than 15 due to return code
 #define INTER_MESSAGE_DELAY 180  // minimum time after transmitting in ms
 

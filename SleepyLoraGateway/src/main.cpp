@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025 Chris Huitema
+
 #include <Arduino.h>
 #include <SX126x-Arduino.h>
 #include <SPI.h>
