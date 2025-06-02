@@ -3,6 +3,7 @@
 
 #include "webserver.h"
 #include "config.h"
+#include "logger.h"
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <Arduino.h>
@@ -310,8 +311,89 @@ void setupWebServer() {
         delay(1000);
         ESP.restart();
     });
+    server.on("/logs", HTTP_GET, [](AsyncWebServerRequest *request){
+        String html = "<html><body style='font-family:monospace; background:#f8f9fa; margin:0; padding:0;'>"
+            "<div style='max-width:480px;margin:32px auto 0 auto;padding:24px 24px 16px 24px;background:#fff;border-radius:10px;box-shadow:0 2px 12px #0001;'>"
+            "<h2>Log Files</h2>";
+        String logList;
+        Logger.listLogs(logList);
+        Serial.print("Logger.listLogs output: ");
+        Serial.println(logList);
+        html += "<ul>";
+        int idx = 0;
+        int start = 0;
+        int fileCount = 0;
+        while ((idx = logList.indexOf('\n', start)) != -1) {
+            String fname = logList.substring(start, idx);
+            if (fname.length() > 0) {
+                String fnameNoSlash = fname;
+                if (fnameNoSlash.startsWith("/")) fnameNoSlash = fnameNoSlash.substring(1);
+                html += "<li><a href='/logfile?name=" + fnameNoSlash + "' download>" + fnameNoSlash + "</a> ";
+                html += "<a href='/logfile?name=" + fnameNoSlash + "' style='margin-left:10px;' download>Download</a></li>";
+                fileCount++;
+            }
+            start = idx + 1;
+        }
+        if (fileCount == 0) html += "<li><i>No log files found</i></li>";
+        html += "</ul>";
+        html += "<form method='POST' action='/clearlogs'><button type='submit'>Clear All Logs</button></form>";
+        html += "<form method='POST' action='/setretention'><label>Retention (days): <input name='days' type='number' min='1' max='30' value='";
+        html += Logger.getRetentionDays();
+        html += "'></label><button type='submit'>Set</button></form>";
+        html += "<form method='POST' action='/flushlog'><button type='submit'>Save Log Now</button></form>";
+        html += "</div></body></html>";
+        request->send(200, "text/html", html);
+    });
+    server.on("/logfile", HTTP_GET, [](AsyncWebServerRequest *request){
+        if (!request->hasParam("name")) {
+            request->send(400, "text/plain", "Missing log file name");
+            return;
+        }
+        String fname = request->getParam("name")->value();
+        if (!fname.startsWith("/")) fname = "/" + fname;
+        File file;
+        if (Logger.getLogFile(fname, file)) {
+            AsyncWebServerResponse *response = request->beginResponse(file, fname, "text/plain", true);
+            request->send(response);
+        } else {
+            request->send(404, "text/plain", "Log file not found");
+        }
+    });
+    server.on("/clearlogs", HTTP_POST, [](AsyncWebServerRequest *request){
+        Logger.clearLogs();
+        request->redirect("/logs");
+    });
+    server.on("/setretention", HTTP_POST, [](AsyncWebServerRequest *request){
+        if (request->hasParam("days", true)) {
+            int days = request->getParam("days", true)->value().toInt();
+            if (days >= 1 && days <= 30) Logger.setRetentionDays(days);
+        }
+        request->redirect("/logs");
+    });
+    server.on("/flushlog", HTTP_POST, [](AsyncWebServerRequest *request){
+        Serial.println("/flushlog endpoint called, flushing log buffer...");
+        String fname = Logger.currentLogFileName();
+        Serial.print("Current log file name: ");
+        Serial.println(fname);
+        Logger.flush();
+        Serial.println("Buffer flushed.");
+        request->redirect("/logs");
+    });
     server.begin();
     Serial.println("Web server started. Portal available on local network IP.");
+    // LittleFS debug
+    Serial.print("LittleFS total bytes: ");
+    Serial.println(LittleFS.totalBytes());
+    Serial.print("LittleFS used bytes: ");
+    Serial.println(LittleFS.usedBytes());
+    File root = LittleFS.open("/");
+    File file = root.openNextFile();
+    Serial.println("Files in LittleFS root:");
+    while (file) {
+        Serial.print("  ");
+        Serial.println(file.name());
+        file = root.openNextFile();
+    }
 }
 
 void checkConfigButton() {

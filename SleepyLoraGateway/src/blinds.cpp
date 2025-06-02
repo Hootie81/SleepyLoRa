@@ -2,6 +2,7 @@
 // Copyright (c) 2025 Chris Huitema
 
 #include "blinds.h"
+#include "logger.h"
 #include <Arduino.h>
 #include <vector>
 #include <Preferences.h>
@@ -146,6 +147,7 @@ void publishGatewayDiscoveryConfig() {
     mqttClient.publish(buttonTopic, 0, true, buttonPayload);
     Serial.print("Published HA discovery for gateway button: ");
     Serial.println(buttonTopic);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=true, payload=%s", buttonTopic, buttonPayload);
 
     // Status sensor: number of blinds
     char sensorTopic[128];
@@ -162,7 +164,7 @@ void publishGatewayDiscoveryConfig() {
     mqttClient.publish(sensorTopic, 0, true, sensorPayload);
     Serial.print("Published HA discovery for gateway sensor: ");
     Serial.println(sensorTopic);
-
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=true, payload=%s", sensorTopic, sensorPayload);
     // IP address sensor
     char ipSensorTopic[128];
     snprintf(ipSensorTopic, sizeof(ipSensorTopic), "homeassistant/sensor/SleepyLoRa_%s/ip/config", deviceId);
@@ -179,7 +181,7 @@ void publishGatewayDiscoveryConfig() {
     mqttClient.publish(ipSensorTopic, 0, true, ipSensorPayload);
     Serial.print("Published HA discovery for gateway IP sensor: ");
     Serial.println(ipSensorTopic);
-
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=true, payload=%s", ipSensorTopic, ipSensorPayload);
     // free_heap sensor
     char freeHeapTopic[128];
     snprintf(freeHeapTopic, sizeof(freeHeapTopic), "homeassistant/sensor/SleepyLoRa_%s/free_heap/config", deviceId);
@@ -195,6 +197,7 @@ void publishGatewayDiscoveryConfig() {
         "}",
         deviceId, deviceId, uniqueId, deviceName);
     mqttClient.publish(freeHeapTopic, 0, true, freeHeapPayload);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=true, payload=%s", freeHeapTopic, freeHeapPayload);
 
     // min_free_heap sensor
     char minFreeHeapTopic[128];
@@ -211,6 +214,7 @@ void publishGatewayDiscoveryConfig() {
         "}",
         deviceId, deviceId, uniqueId, deviceName);
     mqttClient.publish(minFreeHeapTopic, 0, true, minFreeHeapPayload);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=true, payload=%s", minFreeHeapTopic, minFreeHeapPayload);
 
     // total_heap sensor
     char totalHeapTopic[128];
@@ -227,6 +231,7 @@ void publishGatewayDiscoveryConfig() {
         "}",
         deviceId, deviceId, uniqueId, deviceName);
     mqttClient.publish(totalHeapTopic, 0, true, totalHeapPayload);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=true, payload=%s", totalHeapTopic, totalHeapPayload);
 
     // uptime sensor
     char uptimeTopic[128];
@@ -244,6 +249,7 @@ void publishGatewayDiscoveryConfig() {
         "}",
         deviceId, deviceId, uniqueId, deviceName);
     mqttClient.publish(uptimeTopic, 0, true, uptimePayload);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=true, payload=%s", uptimeTopic, uptimePayload);
 
     // availability binary_sensor
     char availTopic[128];
@@ -262,6 +268,7 @@ void publishGatewayDiscoveryConfig() {
         "}",
         deviceId, deviceId, uniqueId, deviceName);
     mqttClient.publish(availTopic, 0, true, availPayload);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=true, payload=%s", availTopic, availPayload);
 }
 
 // Call this in setup after MQTT is connected
@@ -326,6 +333,7 @@ void publishHADiscoveryConfig(const Blind& b) {
     mqttClient.publish(discoveryTopic, 0, true, payload); // retain = true
     Serial.print("Published Home Assistant discovery config: ");
     Serial.println(discoveryTopic);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=true, payload=%s", discoveryTopic, payload);
 
     // Last move status sensor (per blind)
     char lastMoveStatusTopic[128];
@@ -343,6 +351,7 @@ void publishHADiscoveryConfig(const Blind& b) {
         "}",
         b.deviceId, b.blindNumber, b.deviceId, b.blindNumber, b.deviceId, b.blindNumber, b.deviceId, b.blindNumber, b.deviceId, b.blindNumber, deviceName);
     mqttClient.publish(lastMoveStatusTopic, 0, true, lastMoveStatusPayload);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=true, payload=%s", lastMoveStatusTopic, lastMoveStatusPayload);
 
     // Update button
     char updateTopic[128];
@@ -358,7 +367,7 @@ void publishHADiscoveryConfig(const Blind& b) {
         b.deviceId, b.blindNumber, b.deviceId, b.blindNumber, b.deviceId, b.blindNumber
     );
     mqttClient.publish(updateTopic, 0, true, updatePayload);
-
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=true, payload=%s", updateTopic, updatePayload);
 }
 
 // Publish HA discovery config for master device-level sensors (battery, awakeSeconds, wakeCount)
@@ -382,6 +391,7 @@ void publishMasterDeviceDiscoveryConfig(uint32_t deviceId) {
         "}",
         deviceId, deviceId, identifier, deviceName);
     mqttClient.publish(batteryTopic, 0, true, batteryPayload);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=true, payload=%s", batteryTopic, batteryPayload);
     // Awake seconds sensor
     char awakeSecTopic[128];
     snprintf(awakeSecTopic, sizeof(awakeSecTopic), "homeassistant/sensor/SleepyLoRa_%08X_awake_seconds/config", deviceId);
@@ -397,6 +407,7 @@ void publishMasterDeviceDiscoveryConfig(uint32_t deviceId) {
         "}",
         deviceId, deviceId, identifier, deviceName);
     mqttClient.publish(awakeSecTopic, 0, true, awakeSecPayload);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=true, payload=%s", awakeSecTopic, awakeSecPayload);
     // Wake count sensor
     char wakeCountTopic[128];
     snprintf(wakeCountTopic, sizeof(wakeCountTopic), "homeassistant/sensor/SleepyLoRa_%08X_wake_count/config", deviceId);
@@ -410,6 +421,7 @@ void publishMasterDeviceDiscoveryConfig(uint32_t deviceId) {
         "}",
         deviceId, deviceId, identifier, deviceName);
     mqttClient.publish(wakeCountTopic, 0, true, wakeCountPayload);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=true, payload=%s", wakeCountTopic, wakeCountPayload);
 }
 
 void subscribeToAllBlinds() {
@@ -419,12 +431,15 @@ void subscribeToAllBlinds() {
         snprintf(setPosTopic, sizeof(setPosTopic), "SleepyLoRa/%08X_%u/set_position", b.deviceId, b.blindNumber);
         snprintf(updateTopic, sizeof(updateTopic), "SleepyLoRa/%08X_%u/startAP", b.deviceId, b.blindNumber);
         mqttClient.subscribe(cmdTopic, 0);
+        Logger.log("INFO", "MQTT_SUB", "Subscribe: topic=%s, qos=0", cmdTopic);
         Serial.print("Subscribing to topic: ");
         Serial.println(cmdTopic);
         mqttClient.subscribe(setPosTopic, 0);
+        Logger.log("INFO", "MQTT_SUB", "Subscribe: topic=%s, qos=0", setPosTopic);
         Serial.print("Subscribing to topic: ");
         Serial.println(setPosTopic);
         mqttClient.subscribe(updateTopic, 0);
+        Logger.log("INFO", "MQTT_SUB", "Subscribe: topic=%s, qos=0", updateTopic);
         Serial.print("Subscribing to topic: ");
         Serial.println(updateTopic);
         publishHADiscoveryConfig(b);

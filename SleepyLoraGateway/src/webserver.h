@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "logger.h"
+
 void startConfigPortalAP();
 void setupWebServer();
 void checkConfigButton();

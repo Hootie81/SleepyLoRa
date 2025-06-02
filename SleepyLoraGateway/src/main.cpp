@@ -17,6 +17,8 @@
 #include "LoRa_settings.h"
 #include "Device_settings.h"
 #include "Command_Register.h"
+#include "logger.h"
+#include <LittleFS.h>
 
 #include <WiFi.h>
 #include <AsyncMqttClient.h>
@@ -174,6 +176,8 @@ void checkBlindAvailability();
 void handleConfigButton(); // Forward declaration
 void IRAM_ATTR onConfigButtonPress(); // Forward declaration for ISR
 
+Ticker logFlushTicker;
+
 void setup() {
 
   pinMode(LED_PIN, OUTPUT);
@@ -198,7 +202,14 @@ void setup() {
   Serial.print(countdownMS, DEC);
   Serial.println(" milliseconds!");
   Serial.println();
-
+  if (!LittleFS.begin()) {
+      Serial.println("LittleFS mount failed! Formatting...");
+      LittleFS.format();
+      if (!LittleFS.begin()) {
+          Serial.println("LittleFS mount failed after format! Logging disabled.");
+          // Optionally: set a flag to disable logging
+      }
+  }
   // Create node ID
   uint8_t deviceMac[8];
   BoardGetUniqueId(deviceMac);
@@ -256,8 +267,10 @@ void setup() {
 
   gatewayStatusTicker.attach(30, publishGatewayStatus);
   blindAvailabilityTicker.attach_ms(60000, checkBlindAvailability); // check every minute
-
+  logFlushTicker.attach(900, [](){ Logger.flush(); }); // flush log every 15 minutes
   Serial.println("Setup finished");
+  Logger.begin();
+  Logger.log("INFO", "BOOT", "Gateway boot, DeviceID=%08X, Freq=%.1fMHz", deviceID, (double)(config.rf_frequency / 1000000.0));
 }
 
 void loop() {
@@ -291,6 +304,7 @@ void loop() {
       if (mqttDisconnectedSince == 0) mqttDisconnectedSince = millis();
       if ((millis() - mqttDisconnectedSince) > 60000) { // 1 minute
         Serial.println("WARNING: MQTT has been disconnected for over 1 minute!");
+        Logger.log("WARN", "MQTT", "Disconnected >1min");
       }
       connectToMqtt();
     } else {
@@ -298,12 +312,17 @@ void loop() {
     }
   }
 
+  static time_t lastNtp = 0;
   if (WiFi.isConnected()) {
     if (timeClient.update()) {
       time_t timeSet = timeClient.getEpochTime();
+      if (abs((long)(timeSet - lastNtp)) > 1) {
+        Logger.log("INFO", "NTP", "Time synced: %ld (%s)", timeSet, timeClient.getFormattedTime().c_str());
+        lastNtp = timeSet;
+      }
       tv_now.tv_sec = timeSet;
       settimeofday(&tv_now, NULL);
-
+      
       Serial.print("NTP time synced, time set to: ");
       Serial.print(timeSet);
       Serial.print(" : ");
@@ -314,18 +333,20 @@ void loop() {
     if (millis() - pendingTx.lastSendTime > 750) { // timeout
         if (pendingTx.retryCount < 3) {
             Serial.println("No ACK, resending...");
+            Logger.log("WARN", "LORA_ACK", "No ACK, resending, node=0x%08X, retry=%u", pendingTx.awaitingNodeId, pendingTx.retryCount+1);
             sendPacket(); // Resend the same packet
             pendingTx.lastSendTime = millis();
             pendingTx.retryCount++;
         } else {
             Serial.println("No ACK after 3 tries, discarding message.");
+            Logger.log("ERROR", "LORA_ACK", "No ACK after 3 tries, discarding, node=0x%08X", pendingTx.awaitingNodeId);
             TXbuffer.shift();
             pendingTx.awaitingAck = false;
             pendingTx.retryCount = 0;
             pendingTx.awaitingNodeId = 0;
         }
     }
-}
+  }
   if (!RXbuffer.isEmpty()) {
     digitalWrite(LED_PIN, HIGH);
     decodePacket();
@@ -342,12 +363,14 @@ void connectToWifi() { WiFi.begin(config.wifi_ssid, config.wifi_pass); }
 
 void onWifiEvent(WiFiEvent_t event) {
   if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    Logger.log("INFO", "WIFI", "Connected, IP=%s", WiFi.localIP().toString().c_str());
     Serial.println("WiFi connected");
     Serial.println("IP address: ");
     Serial.println(WiFi.localIP());
     timeClient.begin();
     connectToMqtt();
   } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    Logger.log("WARN", "WIFI", "Disconnected");
     gatewayStatusTicker.detach();
     // Optionally, reconnect WiFi here
   }
@@ -438,6 +461,7 @@ void sendPacket() {
   Radio.StartCad();
   // Make sure we detect a timeout during sending
   loraTimeout = millis();
+  Logger.log("INFO", "LORA_TX", "to=0x%08X, cad=%u, enc=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X", loraTXpacket.nodeToId, cadRepeat, encrypted[0], encrypted[1], encrypted[2], encrypted[3], encrypted[4], encrypted[5], encrypted[6], encrypted[7], encrypted[8], encrypted[9], encrypted[10], encrypted[11], encrypted[12], encrypted[13], encrypted[14], encrypted[15]);
 }
 
 // ISR for config button press
@@ -647,14 +671,17 @@ void decodePacket(void) {
     snprintf(topic, sizeof(topic), "SleepyLoRa/%08X/status/Battery", RXbuffer.first().nodeFromId);
     snprintf(payload, sizeof(payload), "%u", battVRX);
     mqttClient.publish(topic, 0, false, payload);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=false, payload=%s", topic, payload);
     // Wake count
     snprintf(topic, sizeof(topic), "SleepyLoRa/%08X/status/wakeCount", RXbuffer.first().nodeFromId);
     snprintf(payload, sizeof(payload), "%u", (unsigned int)wakeCountRX);
     mqttClient.publish(topic, 0, false, payload);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=false, payload=%s", topic, payload);
     // Awake seconds
     snprintf(topic, sizeof(topic), "SleepyLoRa/%08X/status/awakeSeconds", RXbuffer.first().nodeFromId);
     snprintf(payload, sizeof(payload), "%u", awakeTimeRX);
     mqttClient.publish(topic, 0, false, payload);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=false, payload=%s", topic, payload);
 
     RXbuffer.shift();  //we have acted on the command, remove it from buffer
     return;
@@ -727,8 +754,10 @@ void decodePacket(void) {
     char availTopic[80];
     snprintf(availTopic, sizeof(availTopic), "SleepyLoRa/%08X_%u/availability", RXbuffer.first().nodeFromId, blind_number);
     mqttClient.publish(availTopic, 0, true, "online");
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=true, payload=online", availTopic);
 
     mqttClient.publish(stateTopic, 0, false, statePayload);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=false, payload=%s", stateTopic, statePayload);
 
     // Position topic
     char posTopic[64];
@@ -738,6 +767,7 @@ void decodePacket(void) {
     snprintf(posPayload, sizeof(posPayload), "%u", posCalc / 10);
 
     mqttClient.publish(posTopic, 0, false, posPayload);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=false, payload=%s", posTopic, posPayload);
 
     // Last move status attribute topic
     char statusTopic[64];
@@ -757,6 +787,7 @@ void decodePacket(void) {
         strcpy(statusPayload, "UNKNOWN");
     }
     mqttClient.publish(statusTopic, 0, false, statusPayload);
+    Logger.log("INFO", "MQTT_PUB", "Publish: topic=%s, qos=0, retain=false, payload=%s", statusTopic, statusPayload);
 
     RXbuffer.shift();  //we have acted on the command, remove it from buffer
     return;
@@ -780,6 +811,7 @@ void decodePacket(void) {
     default:
       Serial.println("UNKNOWN COMMAND!");
 */
+
 }
 
 void checkBlindAvailability() {
@@ -846,37 +878,30 @@ void radioSetup(void) {
 /**@brief Function to be executed on Radio Rx Done event */
 void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
 
-  char debugOutput[1024];
+  memcpy(&tmploraRXpacket, payload, size);
+
+  String rxHex;
   for (int idx = 0; idx < size; idx++) {
-    sprintf(&debugOutput[(idx * 2)], "%02X", payload[idx]);
+    char buf[3];
+    sprintf(buf, "%02X", payload[idx]);
+    rxHex += buf;
   }
-  //Serial.printf("Receive finished - Data: %s\r\n", debugOutput);
+  Logger.log("INFO", "LORA_RX", "from=0x%08X, size=%u, enc=%s", tmploraRXpacket.nodeToId, size, rxHex.c_str());
 
   if (size != sizeof(tmploraRXpacket)) {
     Serial.println("Packet dropped, wrong size.. ");
+    Logger.log("WARN", "LORA_RX", "Packet dropped, wrong size: %u", size);
     return;
   }
-
-  memcpy((void *)&tmploraRXpacket, payload, size);
-
   if (tmploraRXpacket.nodeToId != deviceID) {
     Serial.println("Packet dropped,  not for us");
+    Logger.log("INFO", "LORA_RX", "Packet dropped, not for us: 0x%08X", tmploraRXpacket.nodeToId);
     return;
   }
-
   //decrypt the message
   memcpy(encrypted, tmploraRXpacket.dataEncrypted, sizeof(encrypted));
   aes128.decryptBlock(decrypted, encrypted);
   memcpy(&dataDEC, decrypted, sizeof(decrypted));
-  //temp disable decryption
-  //memcpy(&dataDEC, &tmploraRXpacket.dataEncrypted, sizeof(tmploraRXpacket.dataEncrypted));
-
-  //Serial.print("Decoded package HEX values: ");
-  //char *printData = (char *)&dataDEC;
-  //for (int idx = 0; idx < sizeof(dataDEC); idx++) {
-  //  Serial.printf("%02X ", printData[idx]);
-  //}
-  //Serial.println();
 
   // print decoded packet
   Serial.print("Message from NodeID: ");
@@ -884,18 +909,18 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
   for (int idx = 0; idx < sizeof(dataDEC.nodeFromId); idx++) {
     Serial.printf("%02X ", printData[idx]);
   }
-  Serial.print("   OTP: ");
+  Serial.print("  OTP: ");
   printData = (char *)&dataDEC.OTP;
   for (int idx = 0; idx < sizeof(dataDEC.OTP); idx++) {
     Serial.printf("%02X ", printData[idx]);
   }
 
-  Serial.print("   Command: ");
+  Serial.print("  Command: ");
   printData = (char *)&dataDEC.command;
   for (int idx = 0; idx < sizeof(dataDEC.command); idx++) {
     Serial.printf("%02X ", printData[idx]);
   }
-  Serial.print("   Payload: ");
+  Serial.print("  Payload: ");
   printData = (char *)&dataDEC.payload;
   for (int idx = 0; idx < sizeof(dataDEC.payload); idx++) {
     Serial.printf("%02X ", printData[idx]);
@@ -917,11 +942,10 @@ if (!RXbuffer.isFull()) {
                                 dataDEC.payload[6],
                                 dataDEC.payload[7] });
 } else {
-    Serial.print("RX Buffer full, dropping packet! ");
+    Logger.log("WARN", "LORA_RX", "RX Buffer full, dropping packet!");
 }
   // LoRa receive finished, go back to loop
 }
-
 
 /**@brief Function to be executed on Radio Rx Timeout event */
 void OnRxTimeout(void) {
@@ -967,12 +991,10 @@ void OnCadDone(bool cadResult) {
       Radio.SetCadParams(LORA_CAD_08_SYMBOL, LORA_SPREADING_FACTOR + 13, 10, LORA_CAD_ONLY, 150);
       Radio.StartCad();
     } else {
-      Serial.printf("############# CAD failed too many times.Gave up afer %ldus\r\n", (micros() - loraTXTime));
+      Serial.printf("CAD failed too many times.Gave up afer %ldus\r\n", (micros() - loraTXTime));
       txComplete = true;
     }
   } else {
-    //Serial.printf("CAD returned channel free after %d times\r\n", cadRepeat);
-    // Send data
     Radio.Send((uint8_t *)&loraTXpacket, sizeof(loraTXpacket));
   }
 }
