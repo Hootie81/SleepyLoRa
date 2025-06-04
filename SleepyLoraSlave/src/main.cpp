@@ -56,7 +56,7 @@
 // UART protocol constants
 #define UART_START_BYTE 0xAA
 #define UART_END_BYTE   0x55
-#define UART_BAUDRATE   19200
+#define UART_BAUDRATE   115200
 #define UART_TX_PIN     6
 #define UART_RX_PIN     5
 uint8_t slave_number = 1; // default
@@ -126,7 +126,7 @@ uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
 }
 
 void sendUARTResponse(uint8_t command, uint8_t *payload) {
-    delayMicroseconds(20); 
+    delayMicroseconds(10); 
     RS485_TRANSMIT();
     delayMicroseconds(20); // Allow line to settle
     uint8_t frame[1 + 1 + 1 + 8 + 2 + 1];
@@ -144,7 +144,7 @@ void sendUARTResponse(uint8_t command, uint8_t *payload) {
     LOG_DEBUG_RAW("\r\n");
     Serial1.write(frame, sizeof(frame));
     Serial1.flush();
-    delayMicroseconds(100); // Allow last byte to leave the bus
+    delayMicroseconds(30); // Allow last byte to leave the bus
     RS485_RECEIVE();
 }
 

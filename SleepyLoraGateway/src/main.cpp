@@ -45,7 +45,6 @@
 #include "config.h"
 #include "blinds.h"
 
-// Forward declaration for master device discovery config
 void publishMasterDeviceDiscoveryConfig(uint32_t deviceId);
 
 #include "mqtt.h"
@@ -117,21 +116,12 @@ struct PendingTx {
 CircularBuffer<data::RXpacket, 10> RXbuffer;
 CircularBuffer<data::TXpacket, 10> TXbuffer;
 
-/** The node ID, created from MAC of ESP32 */
+
 uint32_t deviceID = 0;
-
-/** LoRa error timeout */
 time_t loraTimeout = 0;
-
-/** LoRa TX time */
 time_t loraTXTime = 0;
-
-/** CAD repeat counter */
 uint8_t cadRepeat = 0;
-
 bool txComplete = true;
-
-/** The wakeup time */
 time_t wakeup = 0;
 time_t start_enc = 0;
 time_t lastTX = 0;
@@ -271,6 +261,7 @@ void setup() {
   Serial.println("Setup finished");
   Logger.begin();
   Logger.log("INFO", "BOOT", "Gateway boot, DeviceID=%08X, Freq=%.1fMHz", deviceID, (double)(config.rf_frequency / 1000000.0));
+
 }
 
 void loop() {
@@ -385,7 +376,9 @@ void sendPacket() {
   gettimeofday(&tv_now, NULL);
   int32_t time = (int32_t)tv_now.tv_sec;
 
-  char *newCode = otp->getCode(TXbuffer.first().OTPtime);
+  char *newCode = otp->getCode(
+      (TXbuffer.first().command == 0xBB) ? TXbuffer.first().OTPtime : time
+  );
   uint32_t intCode = atoi((char *)newCode);
 
   dataToENC.OTP[2] = intCode >> 16;
@@ -406,10 +399,6 @@ void sendPacket() {
   aes128.encryptBlock(encrypted, decrypted);  //cypher->output block, plaintext->input block
   memcpy(&loraTXpacket.dataEncrypted, encrypted, sizeof(encrypted));
 
-  //temp disable encryption
-  //memcpy(&loraTXpacket.dataEncrypted, &dataToENC, sizeof(dataToENC));
-
-  //Serial.printf("Message to NodeID: %08X ",TXbuffer.first().nodeToId);
   Serial.print("Message to NodeID: ");
   auto tx = TXbuffer.first();
   char *printToID = (char *)&tx.nodeToId;
@@ -430,18 +419,7 @@ void sendPacket() {
   for (int idx = 0; idx < sizeof(dataToENC); idx++) {
     Serial.printf("%02X ", printData[idx]);
   }
-  //Serial.println();
-  //Serial.print("Data encrypted   HEX values: ");
-  //printData = (char *)&loraTXpacket.dataEncrypted;
-  //for (int idx = 0; idx < sizeof(loraTXpacket.dataEncrypted); idx++) {
-  //  Serial.printf("%02X ", printData[idx]);
-  //}
-  //Serial.println();
-  //Serial.print("DataTX package   HEX values: ");
-  //printData = (char *)&loraTXpacket;
-  //for (int idx = 0; idx < sizeof(loraTXpacket); idx++) {
-  //  Serial.printf("%02X ", printData[idx]);
-  //}
+
   Serial.println();
   Serial.printf("  Packet build time %ldus\r\n", (micros() - start_enc));
 
@@ -510,37 +488,17 @@ void handleConfigButton() {
 uint8_t checkOTP(uint8_t OTP[3]) {
   gettimeofday(&tv_now, NULL);
   int64_t time = (int64_t)tv_now.tv_sec;
-  char *newCode = otp->getCode(time);
-  uint32_t intCode = 0;
-  intCode += (uint32_t)OTP[0];
-  intCode += (uint32_t)OTP[1] << 8;
-  intCode += (uint32_t)OTP[2] << 16;
-
+  uint32_t intCode = OTP[0] | (OTP[1] << 8) | (OTP[2] << 16);
   for (uint8_t idx = 0; idx < OTP_RANGE; idx++) {
-    newCode = otp->getCode(time + idx);
-    if (intCode == atoi((char *)newCode)) {
-      return idx + 1;
-    }
-    newCode = otp->getCode(time - idx);
-    if (intCode == atoi((char *)newCode)) {
-      return (idx + 1) << 4;
-    }
+    if (intCode == (uint32_t)atoi(otp->getCode(time + idx))) return idx + 1;
+    if (intCode == (uint32_t)atoi(otp->getCode(time - idx))) return (idx + 1) << 4;
   }
-  //no codes matched
   return 0x00;
 }
+
 uint8_t oldTimeOTP(uint8_t OTP[3], time_t oldTime) {
-  uint32_t intCode = 0;
-  intCode += (uint32_t)OTP[0];
-  intCode += (uint32_t)OTP[1] << 8;
-  intCode += (uint32_t)OTP[2] << 16;
-
-  char *newCode = otp->getCode(oldTime);
-  if (intCode == atoi((char *)newCode)) {
-    return 0xBB;
-  }
-
-  return 0x00;
+  uint32_t intCode = OTP[0] | (OTP[1] << 8) | (OTP[2] << 16);
+  return (intCode == (uint32_t)atoi(otp->getCode(oldTime))) ? 0xBB : 0x00;
 }
 
 
@@ -551,17 +509,17 @@ void decodePacket(void) {
   //verify OTP is correct
   uint8_t OTPresult = checkOTP(RXbuffer.first().OTP);
 
+  Serial.print("NodeID: ");
+  auto rx = RXbuffer.first();
+  char *printData = (char *)&rx.nodeFromId;
+  for (int idx = 0; idx < sizeof(rx.nodeFromId); idx++) {
+      Serial.printf("%02X ", printData[idx]);
+  }
   Serial.print("   OTP result: ");
   Serial.printf("%02X ", OTPresult);
 
   if ((uint8_t)RXbuffer.first().command == ACK) {
-    Serial.print("ACK received from: ");
-    auto rx = RXbuffer.first();
-    char *printData = (char *)&rx.nodeFromId;
-    for (int idx = 0; idx < sizeof(rx.nodeFromId); idx++) {
-        Serial.printf("%02X ", printData[idx]);
-    }
-    Serial.println();
+    Serial.println("  ACK received");
 
     if (pendingTx.awaitingAck && RXbuffer.first().nodeFromId == pendingTx.awaitingNodeId) {
       TXbuffer.shift();
@@ -577,22 +535,15 @@ void decodePacket(void) {
     Serial.print(" OTP Failied verification ");
     if ((uint8_t)RXbuffer.first().command != TIME_SYNC_COMMAND) {  // only a time sync request is allowed on failed OTP
       // send a NAK, the device should request timesync then resend whatever..
-      Serial.print(" Not a time sync request, Sending Nak ");
-      TXbuffer.push(data::TXpacket{ time,
-                                    RXbuffer.first().nodeFromId,
-                                    NAK,
-                                    (uint8_t)random(0, 255),
-                                    (uint8_t)random(0, 255),
-                                    (uint8_t)random(0, 255),
-                                    (uint8_t)random(0, 255),
-                                    (uint8_t)random(0, 255),
-                                    (uint8_t)random(0, 255),
-                                    (uint8_t)random(0, 255),
-                                    (uint8_t)random(0, 255) });
+      Serial.println(" Not a time sync request, Sending Nak ");
+      TXbuffer.push(data::TXpacket{ time, RXbuffer.first().nodeFromId,  NAK,
+                                    (uint8_t)random(0, 255), (uint8_t)random(0, 255), (uint8_t)random(0, 255),
+                                    (uint8_t)random(0, 255), (uint8_t)random(0, 255), (uint8_t)random(0, 255),
+                                    (uint8_t)random(0, 255), (uint8_t)random(0, 255) });
       RXbuffer.shift();  //we have acted on the command, remove it from buffer.
       return;
     }
-    //retry OTP validation with old time
+    //retry OTP validation with old time. will still accept if incorrect
     Serial.print(" Is a time sync request, verifying devices current time used to generate OTP: ");
     time_t oldTime = 0;
     oldTime += (uint32_t)RXbuffer.first().payload[4];
@@ -607,7 +558,7 @@ void decodePacket(void) {
   //OTP is valid
   if ((uint8_t)RXbuffer.first().command == TIME_SYNC_COMMAND) {
     //time sync request
-    Serial.println("Time Sync Requested");
+    Serial.println("  Time Sync Requested");
     time_t timeSet = 0;
     timeSet += (uint32_t)RXbuffer.first().payload[0];
     timeSet += (uint32_t)RXbuffer.first().payload[1] << 8;
@@ -620,25 +571,17 @@ void decodePacket(void) {
     currentTime[2] = time >> 8;
     currentTime[3] = time;
 
-    TXbuffer.push(data::TXpacket{ timeSet,
-                                  RXbuffer.first().nodeFromId,
-                                  TIME_SYNC_COMMAND,
-                                  (uint8_t)time,
-                                  (uint8_t)(time >> 8),
-                                  (uint8_t)(time >> 16),
-                                  (uint8_t)(time >> 24),
-                                  RXbuffer.first().payload[4],
-                                  RXbuffer.first().payload[5],
-                                  RXbuffer.first().payload[6],
-                                  RXbuffer.first().payload[7] });
+    TXbuffer.push(data::TXpacket{ timeSet, RXbuffer.first().nodeFromId, TIME_SYNC_COMMAND,
+                                  (uint8_t)time, (uint8_t)(time >> 8),
+                                  (uint8_t)(time >> 16), (uint8_t)(time >> 24),
+                                  RXbuffer.first().payload[4], RXbuffer.first().payload[5],
+                                  RXbuffer.first().payload[6], RXbuffer.first().payload[7] });
     RXbuffer.shift();  //we have acted on the command, remove it from buffer
     return;
   }
 
-
   if ((uint8_t)RXbuffer.first().command == NAK) {
-    Serial.println("NAK received from: ");
-    Serial.println(RXbuffer.first().nodeFromId);
+    Serial.println("  NAK received ");
     RXbuffer.shift();  //we have acted on the command, remove it from buffer
     return;
   }
@@ -649,18 +592,18 @@ void decodePacket(void) {
         publishMasterDeviceDiscoveryConfig(RXbuffer.first().nodeFromId);
         publishedMasterDiscovery.insert(RXbuffer.first().nodeFromId);
     }
-    Serial.print("Recieved: DEVICE STATUS");
+    Serial.print("  DEVICE STATUS");
     uint16_t battVRX = 0;
     battVRX += (uint16_t)RXbuffer.first().payload[0] << 8;
     battVRX += (uint16_t)RXbuffer.first().payload[1];
-    Serial.print("  Battery Voltage: ");
+    Serial.print("  Batt Volts: ");
     Serial.print(battVRX);
-    Serial.print("mV  Wakeup Count: ");
+    Serial.print("mV  Wake Count: ");
     uint16_t wakeCountRX = 0;
     wakeCountRX += (uint16_t)RXbuffer.first().payload[2] << 8;
     wakeCountRX += (uint16_t)RXbuffer.first().payload[3];
     Serial.print(wakeCountRX);
-    Serial.print("  Total Awake Time: ");
+    Serial.print(" Awake Time: ");
     uint16_t awakeTimeRX = 0;
     awakeTimeRX += (uint16_t)RXbuffer.first().payload[4] << 8;
     awakeTimeRX += (uint16_t)RXbuffer.first().payload[5];
@@ -688,7 +631,7 @@ void decodePacket(void) {
   }
 
   if ((uint8_t)RXbuffer.first().command == BLIND_STATUS) {
-    Serial.print("Recieved: BLIND STATUS");
+    Serial.print("  BLIND STATUS");
     uint8_t blind_number = RXbuffer.first().payload[0];
     uint8_t blind_state = RXbuffer.first().payload[1];
     uint16_t posCalc = 0;
@@ -699,7 +642,7 @@ void decodePacket(void) {
     posAvg += (uint16_t)RXbuffer.first().payload[5];
     uint8_t moveStatus = RXbuffer.first().payload[6];
     uint8_t moveStatusExt = RXbuffer.first().payload[7]; // should be 0xFF
-    Serial.print("   Blind Number: ");
+    Serial.print(" #: ");
     Serial.print(blind_number);
     const char* statePayload = "unknown";
     Serial.print(" Blind Staus: ");
@@ -724,10 +667,8 @@ void decodePacket(void) {
         Serial.print("Unknown");
         statePayload = "unknown";
     }
-    Serial.print("  Calculated Position: ");
+    Serial.print("  Position: ");
     Serial.print(posCalc / 10.0f);
-    Serial.print("%  Raw Position: ");
-    Serial.print(posAvg / 10.0f);
     Serial.print("%  Last Move Status: ");
     switch (moveStatus) {
       case 0x01:
@@ -792,25 +733,6 @@ void decodePacket(void) {
     RXbuffer.shift();  //we have acted on the command, remove it from buffer
     return;
   }
-  /*
-    case BLIND_COMMAND:
-      Serial.println("BLIND COMMAND");
-      break;
-    case SET_PARAMETER:
-      Serial.println("SET PARAMETER");
-      break;
-    case GET_PARAMETER:
-      Serial.println("GET PARAMETER");
-      break;
-    case SET_LIMIT:
-      Serial.println("SET LIMIT");
-      break;
-    case GET_LIMIT:
-      Serial.println("GET LIMIT");
-      break;
-    default:
-      Serial.println("UNKNOWN COMMAND!");
-*/
 
 }
 
@@ -904,7 +826,7 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
   memcpy(&dataDEC, decrypted, sizeof(decrypted));
 
   // print decoded packet
-  Serial.print("Message from NodeID: ");
+  Serial.print("From NodeID: ");
   char *printData = (char *)&dataDEC.nodeFromId;
   for (int idx = 0; idx < sizeof(dataDEC.nodeFromId); idx++) {
     Serial.printf("%02X ", printData[idx]);

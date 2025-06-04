@@ -341,6 +341,7 @@ void setupWebServer() {
         html += Logger.getRetentionDays();
         html += "'></label><button type='submit'>Set</button></form>";
         html += "<form method='POST' action='/flushlog'><button type='submit'>Save Log Now</button></form>";
+        html += "<form method='POST' action='/formatfs' onsubmit='return confirm(\"Are you sure? This will erase ALL files.\");'><button type='submit' style='background:#b00020;color:#fff;'>Format LittleFS</button></form>";
         html += "</div></body></html>";
         request->send(200, "text/html", html);
     });
@@ -351,16 +352,34 @@ void setupWebServer() {
         }
         String fname = request->getParam("name")->value();
         if (!fname.startsWith("/")) fname = "/" + fname;
+        // If this is today's log, flush buffer and close any open append handle before serving
+        String today = Logger.currentLogFileName();
+        if (fname == today) {
+            Serial.println("Requested file is today's log, flushing and closing append handle before download.");
+            Logger.flush(); // flush buffer to file
+            delay(10); // allow FS to settle
+        }
         File file;
         if (Logger.getLogFile(fname, file)) {
-            AsyncWebServerResponse *response = request->beginResponse(file, fname, "text/plain", true);
+            Serial.printf("Opened log file %s, size: %u\n", fname.c_str(), file.size());
+            if (!file || !file.available()) {
+                Serial.println("File handle invalid or not available!");
+                request->send(500, "text/plain", "Log file open error");
+                return;
+            }
+            Serial.println("Preparing to send file...");
+            AsyncWebServerResponse *response = request->beginResponse(file, fname, "application/octet-stream", true);
+            response->addHeader("Content-Disposition", String("attachment; filename=\"") + fname.substring(1) + "\"");
             request->send(response);
+            Serial.println("File response sent to client (do not close file manually).");
         } else {
             request->send(404, "text/plain", "Log file not found");
         }
     });
     server.on("/clearlogs", HTTP_POST, [](AsyncWebServerRequest *request){
+        Serial.println("/clearlogs endpoint called, clearing all logs...");
         Logger.clearLogs();
+        Serial.println("All logs cleared.");
         request->redirect("/logs");
     });
     server.on("/setretention", HTTP_POST, [](AsyncWebServerRequest *request){
@@ -378,6 +397,11 @@ void setupWebServer() {
         Logger.flush();
         Serial.println("Buffer flushed.");
         request->redirect("/logs");
+    });
+    server.on("/formatfs", HTTP_POST, [](AsyncWebServerRequest *request){
+        Serial.println("/formatfs endpoint called, formatting LittleFS...");
+        Logger.formatFS();
+        request->send(200, "text/html", "<html><body><h2>LittleFS formatted!</h2></body></html>");
     });
     server.begin();
     Serial.println("Web server started. Portal available on local network IP.");
