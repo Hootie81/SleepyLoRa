@@ -9,7 +9,7 @@
 
 #define LOG_BUFFER_SIZE 32  // Number of log entries in RAM buffer
 #define LOG_ENTRY_MAXLEN 192
-#define LOG_FILE_MAX_SIZE (128 * 1024) // 128KB per file
+#define LOG_FILE_MAX_SIZE (512 * 1024) // 512KB per file
 #define LOG_RETENTION_DEFAULT 7 // days
 
 struct LogEntry {
@@ -33,11 +33,14 @@ public:
     bool getLogFile(const String& filename, File& file);
     void removeOldLogs();
     String currentLogFileName(); // Make this public for debug
+    void formatFS();
 private:
     LogEntry buffer[LOG_BUFFER_SIZE];
     uint8_t bufHead = 0, bufCount = 0;
     uint8_t retentionDays = LOG_RETENTION_DEFAULT;
     time_t lastFlushDay = 0;
+    uint8_t logChunk = 0; // For chunked log rotation
+    void deleteOldestLogFile();
 };
 
 extern GatewayLogger Logger;

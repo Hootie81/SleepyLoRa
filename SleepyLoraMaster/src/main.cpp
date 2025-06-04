@@ -91,11 +91,11 @@
 #define RS485_RECEIVE()   digitalWrite(RS485_DIR_PIN, LOW)
 #define UART_START_BYTE 0xAA
 #define UART_END_BYTE   0x55
-#define UART_BAUDRATE   19200
+#define UART_BAUDRATE   115200
 
 #define GET_STATUS 0x08
 #define UPDATE_SLAVE 0x09
-#define UART_TIMEOUT_MS 250
+#define UART_TIMEOUT_MS 60
 uint8_t slave_miss_count[MAX_SLAVES+1] = {0}; // Track missed polls per slave
 #define SLAVE_MISS_THRESHOLD 3                // Number of missed polls before marking as not moving
 
@@ -251,6 +251,8 @@ RTC_DATA_ATTR uint32_t timeNow;  //saved so it can sleep when waiting for timesy
 RTC_DATA_ATTR int posSIM = 0;
 #endif
 
+bool msgInBuffer = false; // Flag to indicate if a message is in the RX buffer when performing a time sync
+
 // Webserver/AP config
 AsyncWebServer server(80);
 Ticker webserverTimeoutTicker;
@@ -331,7 +333,7 @@ bool sendUARTCommandToSlave(uint8_t slave_addr, uint8_t command, uint8_t *payloa
   frame[idx++] = UART_END_BYTE;
   Serial1.write(frame, sizeof(frame));
   Serial1.flush();
-  delayMicroseconds(10); // Allow last byte to leave the bus
+  delayMicroseconds(5); // Allow last byte to leave the bus
   RS485_RECEIVE();
   return true;
 }
@@ -444,7 +446,7 @@ void scanUARTSlavesAndPublish() {
       } else {
           LOG_WARN("[UART RX] No valid response\r\n");
       }
-      delay(50); // Give time for next slave
+      delay(30); // Give time for next slave
   }
   LOG_INFO("[UART SCAN] Scan complete.\r\n");
 }
@@ -1024,7 +1026,11 @@ void loop() {
     if (loraRXbuffer.isEmpty() && !commandReady && txComplete && !(timeSync > 0) && millis() > 90) {
         gettimeofday(&tv_now, NULL);
         int32_t time = (int32_t)tv_now.tv_sec;
-        if (time < 1000) {  //its not set.
+        if (time < 60000000) {  //its not set, but could be second run
+          if(time < 15000000) { //its first run since boot, give a random seed for otp
+            tv_now.tv_sec = random(15000001, 30000000);
+            settimeofday(&tv_now, NULL);
+          }
             if (!(lastTimeSync == 0) && time - lastTimeSync < TIME_SYNC_RATE_LIMIT) {
                 //its failed recently
             } else {
@@ -1263,13 +1269,20 @@ void buildPacket(uint32_t toNodeID, time_t OTPtime, commandPacket commandToSend)
   if (fullInit == false) {
     radioInit();
   }
+  // wait for the previous packet to finish transmitting otherwise we will overwrite data
+  int ctr = 0;
+  while (!txComplete && ctr < 50) {
+    LOG_WARN("waiting for TX to complete\r\n");
+    ctr++;
+    delay(100);
+  }
 
   gettimeofday(&tv_now, NULL);
   int32_t time = (int32_t)tv_now.tv_sec;
 
-  char *newCode = otp.getCode(OTPtime);
+  char *newCode = otp.getCode(time); // Get the OTP code for the current time instead of OTPtime
   uint32_t intCode = atoi((char *)newCode);
-  LOG_INFO("Time to use for otp: %ld   OTP code: %u\r\n", OTPtime, intCode);
+  LOG_INFO("OTP Time: %ld   OTP code: %u\r\n", time, intCode);
   dataToENC.OTP[2] = intCode >> 16;
   dataToENC.OTP[1] = intCode >> 8;
   dataToENC.OTP[0] = intCode >> 0;
@@ -1282,22 +1295,12 @@ void buildPacket(uint32_t toNodeID, time_t OTPtime, commandPacket commandToSend)
     dataToENC.payload[idx] = commandToSend.payload[idx];
   }
 
-  // wait for the previous packet to finish transmitting otherwise we will overwrite data
-  int ctr = 0;
-  while (!txComplete && ctr < 5) {
-    LOG_WARN("waiting for TX to complete\r\n");
-    ctr++;
-    delay(500);
-  }
-
   loraTXpacket.nodeToId = toNodeID;
 
   //encrypt the data payload
   memcpy(decrypted, &dataToENC, sizeof(decrypted));
   aes128.encryptBlock(encrypted, decrypted);  //cypher->output block, plaintext->input block
   memcpy(&loraTXpacket.dataEncrypted, encrypted, sizeof(encrypted));
-
-  LOG_INFO("Time now: %ld\r\n", time);
 
   LOG_DEBUG("Data To ENC as   HEX values: ");
   char *printData = (char *)&dataToENC;
@@ -1642,6 +1645,7 @@ void parsePacket(void) {
   if (OTPresult == 0x00) {  //OTP failed and needs to sync time with server
     LOG_WARN(" OTP Failied verification \r\n");
     prepareCommand(ACK);
+    msgInBuffer = true;
     performTimeSync();
     return;
 
@@ -1685,9 +1689,13 @@ void performTimeSync(void) {
   int32_t time = (int32_t)tv_now.tv_sec;
 
   if (!(lastTimeSync == 0) && time - lastTimeSync < TIME_SYNC_RATE_LIMIT) {
-    //time just synced so bin it
-    LOG_WARN(" OTP Failed but time was recently set, bin the message \r\n");
-    loraRXbuffer.shift();
+    if (msgInBuffer){
+      msgInBuffer = false;
+      loraRXbuffer.shift();
+      LOG_WARN(" OTP Failed but time was recently set, bin the message \r\n");
+    } else {
+      LOG_WARN(" Time sync rate limit exceeded, time set less than 5seconds ago \r\n");
+    }
     return;
   }
 
@@ -1698,37 +1706,32 @@ void performTimeSync(void) {
     LOG_INFO(" Attempting to sync time with gateway, try %d\r\n", timeSync);
 
     timeNow = (uint32_t)tv_now.tv_sec;
-    time_t oldTime = timeNow;
-    time_t tmpTime = timeNow;
-    LOG_INFO("Device Time now: %u", timeNow);
-    if (timeNow <= 200000) {  //RTC has reset, or prevoius random number.. generate a new one
-      timeNow = random(1000, 200000);
-      tmpTime = random(1, 400000);  // use a random for the OTP for this packet so its different to the payload. it will fail anyway.
-      LOG_INFO("   RTC not set, using random for OTP: %u using random for reply OTP: %u\r\n", tmpTime, timeNow);
-    }
-    LOG_INFO("\r\n");
     commandTX.command = TIME_SYNC_COMMAND;
     commandTX.payload[3] = timeNow >> 24;
     commandTX.payload[2] = timeNow >> 16;
     commandTX.payload[1] = timeNow >> 8;
     commandTX.payload[0] = timeNow;
-    commandTX.payload[7] = oldTime >> 24;
-    commandTX.payload[6] = oldTime >> 16;
-    commandTX.payload[5] = oldTime >> 8;
-    commandTX.payload[4] = oldTime;
+    commandTX.payload[7] = timeNow >> 24;
+    commandTX.payload[6] = timeNow >> 16;
+    commandTX.payload[5] = timeNow >> 8;
+    commandTX.payload[4] = timeNow;
 
-    buildPacket(config_gatewayID, tmpTime, commandTX);  //build and send the packet
+    buildPacket(config_gatewayID, time, commandTX);  //build and send the packet
     return;
-  }
-  if (timeSync > TIME_SYNC_RETRIES) {
+  } else {
     //failed to sync time
-    LOG_WARN(". nope timesync failed, bin the message\r\n");
     timeSync = 0;
     lastTimeSync = time;
-    loraRXbuffer.shift();
+    if (msgInBuffer){
+      msgInBuffer = false;
+      loraRXbuffer.shift();
+      LOG_WARN(" OTP Failed to sync 3 times, discarding message \r\n");
+    } else {
+      LOG_WARN(" Time sync failed 3 times \r\n");
+    }
     return;
   }
-  LOG_WARN(" Oops... Shouldnt get here in the failed OTP section \r\n");
+
 }  // end of performTimeSync
 
 
