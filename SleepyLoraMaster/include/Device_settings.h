@@ -3,7 +3,7 @@
 
 #define TIME_TO_SLEEP  60      // Time ESP32 will go to sleep (in seconds).
 #define MAX_AWAKE_TIME 300000   // max time the device can be awake
-#define UPDATE_PERIOD 30        // how often to send updates
+#define UPDATE_PERIOD 60        // how often to send updates
 #define OTP_RANGE 5             // max time difference allowed for valid OTP 
 #define MOVING_UPDATE_PERIOD 1500
 
@@ -22,8 +22,11 @@
 
 #define LED_PIN 35
 
-#define IN_A_PIN 17 //6
-#define IN_B_PIN 18 //5
+#define IN_A_PIN 17 //
+#define IN_B_PIN 18 //
+//#define IN_A_PIN 5 //legacy pinout
+//#define IN_B_PIN 6 //legacy pinout
+
 #define EN_PIN 4
 
 #define CLOSED_RAW 0 //19
