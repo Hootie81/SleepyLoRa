@@ -144,7 +144,8 @@ struct timeval tv_now;
 ESP32Time rtc(28800);
 
 /** creating an object of TOTP class */
-TOTP otp = TOTP(config_hmacKey, 10, 1);
+//TOTP otp = TOTP(config_hmacKey, 10, 1);
+TOTP* otp = nullptr;
 
 #define uS_TO_S_FACTOR 1000000 /* Conversion factor for micro seconds to seconds */
 
@@ -950,6 +951,8 @@ void setup() {
   }
 
   aes128.setKey(config_aes_key, 16);
+  if (otp) delete otp;
+  otp = new TOTP(config_hmacKey, 10, 1);
   // Setup the radio
   radioSetup();
 
@@ -976,22 +979,14 @@ void loop() {
         parsePacket();
     }
 
-    if (millis() - position_updated > MOVING_UPDATE_PERIOD) {
-        position_updated = millis();
-        uint16_t tmpPos = readPosition();
-
-        LOG_INFO("Blind Position: %.1f%%\r\n", tmpPos / 10.0f);
-
-    }
     if (motor_running) {
-      if (millis() - status_update > 1000) {
+      if (millis() - status_update > MOVING_UPDATE_PERIOD) {
         status_update = millis();
         prepareCommand(BLIND_STATUS, 0, blind_state, readPosition(), readPosition(), last_move_status);
       }
-      return;
     }
     if (any_slave_moving()) {
-      if (millis() - slave_status_update > 1000) {
+      if (millis() - slave_status_update > MOVING_UPDATE_PERIOD) {
         slave_status_update = millis();
         for (uint8_t i = 0; i < detected_slave_count; ++i) {
           uint8_t blind_number = detected_slaves[i];
@@ -1000,7 +995,6 @@ void loop() {
           }
         }
       }
-      return;
     }
     if (configPortalActive && millis() - configPortalStartTime > 5 * 60 * 1000) {
         stopConfigAPAndWebserver(); // Your function to stop the web portal
@@ -1041,17 +1035,14 @@ void loop() {
 
         if (time - lastSend > UPDATE_PERIOD && timeSync == 0) {
             lastSend = time;
-
+            slave_reading = true;
             prepareCommand(DEVICE_STATUS);
-            // Fix: Send correct master blind status (blind_number=0)
-                // Ensure blind_state is set
             uint16_t pos = readPosition();
             if (blind_state != STATE_OPEN && blind_state != STATE_CLOSED && blind_state != STATE_OPENING && blind_state != STATE_CLOSING) {
-                // Set based on position
                 blind_state = (pos > 10) ? STATE_OPEN : STATE_CLOSED;
             }
             prepareCommand(BLIND_STATUS, 0, blind_state, readPosition(), readPosition(), last_move_status);
-            slave_reading = true;
+            
             if (detected_slave_count > 0) ensureVBATOn();
             for (uint8_t i = 0; i < detected_slave_count; ++i) {
               pollSlaveStatusUART(detected_slaves[i]);
@@ -1060,7 +1051,7 @@ void loop() {
             updateVBATState();
             return;
         }
-        if (configPortalActive == true){
+        if (configPortalActive == true || motor_running || any_slave_moving() || slave_reading) {
             // If config portal is active, don't go to sleep
             return;
         }
@@ -1068,7 +1059,7 @@ void loop() {
           return;
         }
         // nothing left to do..
-        //if (millis() - wakeup < 150) return;
+
         goToSleep();
     }
     updateVBATState();
@@ -1104,7 +1095,7 @@ uint16_t checkBAT(void) {
   return battCalc;
 }
 
-// function to enable the 2nd voltage regulator, used for position sensor
+// function to enable the 2nd voltage regulator, used for position sensor and rs485 module
 bool vEXT(bool vext_set_state) {
   if (vext_set_state && !vext_state) {
     // requested on, but current state is off
@@ -1199,6 +1190,7 @@ void update_motor(void) {
         blind_state = STATE_CLOSED;
       }
       last_move_status = MOVE_STATUS_OK;
+      prepareCommand(BLIND_STATUS, 0, blind_state, readPosition(), readPosition(), last_move_status);
       setVBATKeepOn(disengage_time + 500); // Keep vBAT on for disengage period
       disengage_motor();
       return;
@@ -1212,6 +1204,7 @@ void update_motor(void) {
           blind_state = STATE_CLOSED;
         }
         last_move_status = MOVE_STATUS_TIMEOUT;
+        prepareCommand(BLIND_STATUS, 0, blind_state, readPosition(), readPosition(), last_move_status);
         setVBATKeepOn(disengage_time + 500); // Keep vBAT on for disengage period
         disengage_motor();
         return;
@@ -1235,33 +1228,20 @@ void stop_motor(void) {
 }
 
 uint8_t checkOTP(uint8_t OTP[3]) {
+  
   gettimeofday(&tv_now, NULL);
   int64_t time = (int64_t)tv_now.tv_sec;
-  char *newCode;
-  uint32_t intCode;
-  intCode += (uint32_t)OTP[0];
-  intCode += (uint32_t)OTP[1] << 8;
-  intCode += (uint32_t)OTP[2] << 16;
-
-  if (timeSync > 0) {  //could be using random number in timeNow, otherwise otp may be predictable when rtc is 0
-    newCode = otp.getCode(timeNow);
-    if (intCode == atoi((char *)newCode)) {
-      return 0xBB;
-    }
+  uint32_t intCode = OTP[0] | (OTP[1] << 8) | (OTP[2] << 16);
+  if (timeSync > 0) {  //could be using random time set in timeNow, otherwise otp may be predictable when rtc is 0
+    if (intCode == (uint32_t)atoi(otp->getCode(timeNow))) return 0xBB;
   }
   for (uint8_t idx = 0; idx < OTP_RANGE; idx++) {
-    newCode = otp.getCode(time + idx);
-    if (intCode == atoi((char *)newCode)) {
-      return idx + 1;
-    }
-    newCode = otp.getCode(time - idx);
-    if (intCode == atoi((char *)newCode)) {
-      return (idx + 1) << 4;
-    }
+    if (intCode == (uint32_t)atoi(otp->getCode(time + idx))) return idx + 1;
+    if (intCode == (uint32_t)atoi(otp->getCode(time - idx))) return (idx + 1) << 4;
   }
-  //no codes matched
   return 0x00;
 }
+
 
 void buildPacket(uint32_t toNodeID, time_t OTPtime, commandPacket commandToSend) {
   start_enc = millis();
@@ -1280,7 +1260,7 @@ void buildPacket(uint32_t toNodeID, time_t OTPtime, commandPacket commandToSend)
   gettimeofday(&tv_now, NULL);
   int32_t time = (int32_t)tv_now.tv_sec;
 
-  char *newCode = otp.getCode(time); // Get the OTP code for the current time instead of OTPtime
+  char *newCode = otp->getCode(time); // Get the OTP code for the current time instead of OTPtime
   uint32_t intCode = atoi((char *)newCode);
   LOG_INFO("OTP Time: %ld   OTP code: %u\r\n", time, intCode);
   dataToENC.OTP[2] = intCode >> 16;
