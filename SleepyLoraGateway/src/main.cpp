@@ -171,8 +171,8 @@ Ticker logFlushTicker;
 // Track time since last LoRa RX and reset attempts
 unsigned long lastLoraRxTime = 0;
 uint8_t loraResetAttempts = 0;
-const unsigned long LORA_RX_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
-const uint8_t LORA_MAX_RESETS = 2;
+const unsigned long LORA_RX_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
+const uint8_t LORA_MAX_RESETS = 5;
 
 void setup() {
 
@@ -301,9 +301,16 @@ void loop() {
     lastMqttCheck = millis();
     if (!mqttClient.connected()) {
       if (mqttDisconnectedSince == 0) mqttDisconnectedSince = millis();
-      if ((millis() - mqttDisconnectedSince) > 60000) { // 1 minute
+      unsigned long disconnectedDuration = millis() - mqttDisconnectedSince;
+      if (disconnectedDuration > 60000 && disconnectedDuration <= 300000) { // 1-5 minutes
         Serial.println("WARNING: MQTT has been disconnected for over 1 minute!");
         Logger.log("WARN", "MQTT", "Disconnected >1min");
+      }
+      if (disconnectedDuration > 300000) { // 5 minutes
+        Serial.println("ERROR: MQTT has been disconnected for over 5 minutes. Restarting device.");
+        Logger.log("ERROR", "MQTT", "Disconnected >5min, restarting device");
+        delay(1000);
+        ESP.restart();
       }
       connectToMqtt();
     } else {
@@ -311,21 +318,25 @@ void loop() {
     }
   }
 
-  static time_t lastNtp = 0;
   if (WiFi.isConnected()) {
+    time_t prevEpoch = timeClient.getEpochTime();
     if (timeClient.update()) {
       time_t timeSet = timeClient.getEpochTime();
-      if (abs((long)(timeSet - lastNtp)) > 1) {
-        Logger.log("INFO", "NTP", "Time synced: %ld (%s)", timeSet, timeClient.getFormattedTime().c_str());
-        lastNtp = timeSet;
+      long timeDelta = (long)(timeSet - prevEpoch);
+      if (abs(timeDelta) > 1) {
+        const char* direction = (timeDelta > 0) ? "forward" : "backward";
+        Logger.log("INFO", "NTP", "Time synced: %ld (%s), adjusted %ld sec %s", timeSet, timeClient.getFormattedTime().c_str(), labs(timeDelta), direction);
+        Serial.print("NTP time synced, time set to: ");
+        Serial.print(timeSet);
+        Serial.print(" : ");
+        Serial.print(timeClient.getFormattedTime());
+        Serial.print(" | Adjustment: ");
+        Serial.print(labs(timeDelta));
+        Serial.print(" sec ");
+        Serial.println(direction);
       }
       tv_now.tv_sec = timeSet;
       settimeofday(&tv_now, NULL);
-      
-      Serial.print("NTP time synced, time set to: ");
-      Serial.print(timeSet);
-      Serial.print(" : ");
-      Serial.println(timeClient.getFormattedTime());
     }
   }
   if (pendingTx.awaitingAck && !TXbuffer.isEmpty()) {
@@ -443,6 +454,37 @@ void sendPacket() {
     Serial.printf("%02X ", printData[idx]);
   }
 
+  // Log the TX message in the same format as RX
+  char txMsg[128];
+  int txOffset = 0;
+  txOffset += snprintf(txMsg + txOffset, sizeof(txMsg) - txOffset, "From: ");
+  printData = (char *)&dataToENC.nodeFromId;
+  for (int idx = 0; idx < sizeof(dataToENC.nodeFromId); idx++) {
+    txOffset += snprintf(txMsg + txOffset, sizeof(txMsg) - txOffset, "%02X ", (uint8_t)printData[idx]);
+  }
+  txOffset += snprintf(txMsg + txOffset, sizeof(txMsg) - txOffset, "To: ");
+  auto tx_f = TXbuffer.first();
+  printData = (char *)&tx_f.nodeToId;
+  for (int idx = 0; idx < sizeof(tx_f.nodeToId); idx++) {
+    txOffset += snprintf(txMsg + txOffset, sizeof(txMsg) - txOffset, "%02X ", (uint8_t)printData[idx]);
+  }
+  txOffset += snprintf(txMsg + txOffset, sizeof(txMsg) - txOffset, "  OTP: ");
+  printData = (char *)&dataToENC.OTP;
+  for (int idx = 0; idx < sizeof(dataToENC.OTP); idx++) {
+    txOffset += snprintf(txMsg + txOffset, sizeof(txMsg) - txOffset, "%02X ", (uint8_t)printData[idx]);
+  }
+  txOffset += snprintf(txMsg + txOffset, sizeof(txMsg) - txOffset, "  Command: ");
+  printData = (char *)&dataToENC.command;
+  for (int idx = 0; idx < sizeof(dataToENC.command); idx++) {
+    txOffset += snprintf(txMsg + txOffset, sizeof(txMsg) - txOffset, "%02X ", (uint8_t)printData[idx]);
+  }
+  txOffset += snprintf(txMsg + txOffset, sizeof(txMsg) - txOffset, "  Payload: ");
+  printData = (char *)&dataToENC.payload;
+  for (int idx = 0; idx < sizeof(dataToENC.payload); idx++) {
+    txOffset += snprintf(txMsg + txOffset, sizeof(txMsg) - txOffset, "%02X ", (uint8_t)printData[idx]);
+  }
+  Logger.log("INFO", "LORA_TX", "%s", txMsg);
+  
   Serial.println();
   Serial.printf("  Packet build time %ldus\r\n", (micros() - start_enc));
 
@@ -462,7 +504,7 @@ void sendPacket() {
   Radio.StartCad();
   // Make sure we detect a timeout during sending
   loraTimeout = millis();
-  Logger.log("INFO", "LORA_TX", "to=0x%08X, cad=%u, enc=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X", loraTXpacket.nodeToId, cadRepeat, encrypted[0], encrypted[1], encrypted[2], encrypted[3], encrypted[4], encrypted[5], encrypted[6], encrypted[7], encrypted[8], encrypted[9], encrypted[10], encrypted[11], encrypted[12], encrypted[13], encrypted[14], encrypted[15]);
+
 }
 
 // ISR for config button press
@@ -825,24 +867,27 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
   lastLoraRxTime = millis(); // Update RX time on every packet
   loraResetAttempts = 0;     // Reset attempts counter on successful RX
 
-  memcpy(&tmploraRXpacket, payload, size);
-
-  String rxHex;
-  for (int idx = 0; idx < size; idx++) {
-    char buf[3];
-    sprintf(buf, "%02X", payload[idx]);
-    rxHex += buf;
-  }
-  Logger.log("INFO", "LORA_RX", "from=0x%08X, size=%u, enc=%s", tmploraRXpacket.nodeToId, size, rxHex.c_str());
-
+  // Only copy if the size matches the expected struct size
   if (size != sizeof(tmploraRXpacket)) {
     Serial.println("Packet dropped, wrong size.. ");
     Logger.log("WARN", "LORA_RX", "Packet dropped, wrong size: %u", size);
     return;
   }
+
+  memcpy(&tmploraRXpacket, payload, size);
+
+
+
   if (tmploraRXpacket.nodeToId != deviceID) {
-    Serial.println("Packet dropped,  not for us");
+    String rxHex;
+    for (int idx = 0; idx < size; idx++) {
+      char buf[3];
+      sprintf(buf, "%02X", payload[idx]);
+      rxHex += buf;
+    }
+    Logger.log("INFO", "LORA_RX", "To=0x%08X, size=%u, enc=%s", tmploraRXpacket.nodeToId, size, rxHex.c_str());
     Logger.log("INFO", "LORA_RX", "Packet dropped, not for us: 0x%08X", tmploraRXpacket.nodeToId);
+    Serial.println("Packet dropped,  not for us");
     return;
   }
   //decrypt the message
@@ -861,7 +906,6 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
   for (int idx = 0; idx < sizeof(dataDEC.OTP); idx++) {
     Serial.printf("%02X ", printData[idx]);
   }
-
   Serial.print("  Command: ");
   printData = (char *)&dataDEC.command;
   for (int idx = 0; idx < sizeof(dataDEC.command); idx++) {
@@ -873,6 +917,37 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
     Serial.printf("%02X ", printData[idx]);
   }
   Serial.println();
+
+  // Log the decoded message in the same format
+  char decodedMsg[128];
+  int offset = 0;
+    offset += snprintf(decodedMsg + offset, sizeof(decodedMsg) - offset, "From: ");
+  printData = (char *)&dataDEC.nodeFromId;
+  for (int idx = 0; idx < sizeof(dataDEC.nodeFromId); idx++) {
+    offset += snprintf(decodedMsg + offset, sizeof(decodedMsg) - offset, "%02X ", (uint8_t)printData[idx]);
+  }
+  offset += snprintf(decodedMsg + offset, sizeof(decodedMsg) - offset, "To: ");
+  printData = (char *)&tmploraRXpacket.nodeToId;
+  for (int idx = 0; idx < sizeof(tmploraRXpacket.nodeToId); idx++) {
+    offset += snprintf(decodedMsg + offset, sizeof(decodedMsg) - offset, "%02X ", (uint8_t)printData[idx]);
+  }
+  offset += snprintf(decodedMsg + offset, sizeof(decodedMsg) - offset, "  OTP: ");
+  printData = (char *)&dataDEC.OTP;
+  for (int idx = 0; idx < sizeof(dataDEC.OTP); idx++) {
+    offset += snprintf(decodedMsg + offset, sizeof(decodedMsg) - offset, "%02X ", (uint8_t)printData[idx]);
+  }
+  offset += snprintf(decodedMsg + offset, sizeof(decodedMsg) - offset, "  Command: ");
+  printData = (char *)&dataDEC.command;
+  for (int idx = 0; idx < sizeof(dataDEC.command); idx++) {
+    offset += snprintf(decodedMsg + offset, sizeof(decodedMsg) - offset, "%02X ", (uint8_t)printData[idx]);
+  }
+  offset += snprintf(decodedMsg + offset, sizeof(decodedMsg) - offset, "  Payload: ");
+  printData = (char *)&dataDEC.payload;
+  for (int idx = 0; idx < sizeof(dataDEC.payload); idx++) {
+    offset += snprintf(decodedMsg + offset, sizeof(decodedMsg) - offset, "%02X ", (uint8_t)printData[idx]);
+  }
+  Logger.log("INFO", "LORA_RX", "%s", decodedMsg);
+
 if (!RXbuffer.isFull()) {
   RXbuffer.push(data::RXpacket{ tmploraRXpacket.nodeToId,
                                 dataDEC.OTP[0],
