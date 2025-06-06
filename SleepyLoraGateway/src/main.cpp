@@ -247,7 +247,7 @@ void setup() {
   setupWebServer();
   setupMqttClient();
   loadBlindsFromFlash();
-  mqttClient.setKeepAlive(60); // 60 seconds
+  mqttClient.setKeepAlive(15); // 15 seconds
   Watchdog.reset();
 
   Serial.println();
