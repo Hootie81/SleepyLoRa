@@ -168,6 +168,12 @@ void IRAM_ATTR onConfigButtonPress(); // Forward declaration for ISR
 
 Ticker logFlushTicker;
 
+// Track time since last LoRa RX and reset attempts
+unsigned long lastLoraRxTime = 0;
+uint8_t loraResetAttempts = 0;
+const unsigned long LORA_RX_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const uint8_t LORA_MAX_RESETS = 2;
+
 void setup() {
 
   pinMode(LED_PIN, OUTPUT);
@@ -262,6 +268,8 @@ void setup() {
   Logger.begin();
   Logger.log("INFO", "BOOT", "Gateway boot, DeviceID=%08X, Freq=%.1fMHz", deviceID, (double)(config.rf_frequency / 1000000.0));
 
+  lastLoraRxTime = millis(); // Initialize last RX time
+  loraResetAttempts = 0;
 }
 
 void loop() {
@@ -347,6 +355,21 @@ void loop() {
     digitalWrite(LED_PIN, HIGH);
     sendPacket();
     digitalWrite(LED_PIN, LOW);
+  }
+
+  // LoRa RX watchdog logic
+  if (millis() - lastLoraRxTime > LORA_RX_TIMEOUT_MS) {
+    Serial.println("WARNING: No LoRa RX for over 5 minutes. Attempting radio reset.");
+    Logger.log("WARN", "LORA_WATCHDOG", "No RX >5min, resetting radio (attempt %u)", loraResetAttempts+1);
+    radioSetup();
+    lastLoraRxTime = millis(); // Reset timer after radio reset
+    loraResetAttempts++;
+    if (loraResetAttempts >= LORA_MAX_RESETS) {
+      Serial.println("ERROR: LoRa radio unresponsive after multiple resets. Restarting device.");
+      Logger.log("ERROR", "LORA_WATCHDOG", "Radio unresponsive after %u resets, restarting", LORA_MAX_RESETS);
+      delay(1000);
+      ESP.restart();
+    }
   }
 }
 
@@ -799,6 +822,8 @@ void radioSetup(void) {
 
 /**@brief Function to be executed on Radio Rx Done event */
 void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
+  lastLoraRxTime = millis(); // Update RX time on every packet
+  loraResetAttempts = 0;     // Reset attempts counter on successful RX
 
   memcpy(&tmploraRXpacket, payload, size);
 
