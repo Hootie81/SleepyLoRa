@@ -5,7 +5,7 @@ A low-power wireless smart blinds system using LoRa to enable low power yet fast
 In July 2023 I set out the key requirements for the project
 - 100% local control - no 3rd party servers etc.
 - solar powered with up to 3days bad weather.
-- back drive able without breaking.
+- back driveable without breaking.
 - secure
 - be cheap
 
@@ -13,7 +13,7 @@ This system is 100% local, no external access required at all.
 
 A 2.5w 380mm x 70mm thin film flexible panel is enough to keep a 2000mah battery fully charged with less than 2 hours a day of sun. the 2000mah battery lasts about 10 days with no panel connected.
 
-Key design requirement was for the blinds to still operate by hand, so a mechanism was developed that disengages the motor from the actuator once the move command is complete. 
+Key design requirement was for the blinds to still operate by hand, so a mechanism was developed that disengages the motor from the actuator once the move command is complete. [See disengage mechanism video](https://youtu.be/guv8YasCPMQ?si=FenjIrAAZN0NFrJr)
 
 Position is sensed using a linear potentiometer thats connected to the actualing arm, so the blinds always know their position.
 
@@ -21,7 +21,10 @@ All data packets are AES128 encrypted and hardened against replay attacks using 
 Costs are kept low by using cheap modules form china, assembled onto custom PCB's and housed in 3d printed parts.
 The wired slaves are powered by the master, thus only a single battery and solar panel per system and a significant reduction in actuator cost too. 
 
-This project includes electronics designs, firmware, and 3D printable parts for a complete DIY solution. 
+This project includes electronics designs, firmware, and 3D printable parts for a complete DIY solution.
+
+- [3D Parts Assembly Video](https://youtu.be/qfTnw-1N8DM?si=_8NIrLeuZx0titTB)
+- [Electronics Assembly Video](https://youtu.be/dtDF-GL67Ew?si=iw6Ndi3xGu8mUtQ1)
 
 This has been a couple of years in the making, and still very much a work in progress. If you find this project useful, please consider supporting my work:
 
