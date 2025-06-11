@@ -2,6 +2,7 @@
 // Logging system implementation for SleepyLoraGateway
 #include "logger.h"
 #include <stdarg.h>
+#include <sys/time.h>
 
 GatewayLogger Logger;
 
@@ -50,7 +51,7 @@ void GatewayLogger::begin() {
 
 void GatewayLogger::log(const char* level, const char* event, const char* fmt, ...) {
     LogEntry& entry = buffer[bufHead];
-    entry.timestamp = time(nullptr);
+    gettimeofday(&entry.tv, NULL); // microsecond timestamp
     strncpy(entry.level, level, sizeof(entry.level) - 1);
     entry.level[sizeof(entry.level) - 1] = 0;
     strncpy(entry.event, event, sizeof(entry.event) - 1);
@@ -69,11 +70,15 @@ void GatewayLogger::deleteOldestLogFile() {
     File file = root.openNextFile();
     String oldestName;
     time_t oldestTime = LONG_MAX;
+    bool found = false;
     while (file) {
         String name = file.name();
-        if (name.startsWith("/log_")) {
+        // Accept both /log_ and log_ (no slash), and any chunked log files
+        if (name.startsWith("/log_") || name.startsWith("log_")) {
+            String fullName = name.startsWith("/") ? name : ("/" + name);
+            // Extract date from /log_YYYYMMDD[_N].txt
             int y, m, d;
-            if (sscanf(name.c_str(), "/log_%4d%2d%2d", &y, &m, &d) == 3) {
+            if (sscanf(fullName.c_str(), "/log_%4d%2d%2d", &y, &m, &d) == 3) {
                 struct tm tm = {0};
                 tm.tm_year = y - 1900;
                 tm.tm_mon = m - 1;
@@ -81,13 +86,14 @@ void GatewayLogger::deleteOldestLogFile() {
                 time_t fileTime = mktime(&tm);
                 if (fileTime < oldestTime) {
                     oldestTime = fileTime;
-                    oldestName = name;
+                    oldestName = fullName;
+                    found = true;
                 }
             }
         }
         file = root.openNextFile();
     }
-    if (oldestName.length() > 0) {
+    if (found && oldestName.length() > 0) {
         Serial.printf("[Logger] Free space low, deleting oldest log file: %s\r\n", oldestName.c_str());
         LittleFS.remove(oldestName);
     } else {
@@ -172,11 +178,12 @@ void GatewayLogger::flush() {
     for (uint8_t i = 0; i < bufCount; ++i) {
         uint8_t idx = (bufHead + LOG_BUFFER_SIZE - bufCount + i) % LOG_BUFFER_SIZE;
         LogEntry& e = buffer[idx];
-        char line[LOG_ENTRY_MAXLEN + 64];
-        struct tm* tm = localtime(&e.timestamp);
-        snprintf(line, sizeof(line), "%04d-%02d-%02dT%02d:%02d:%02d,%s,%s,%s\r\n",
+        char line[LOG_ENTRY_MAXLEN + 80];
+        struct tm* tm = localtime(&e.tv.tv_sec);
+        snprintf(line, sizeof(line), "%04d-%02d-%02dT%02d:%02d:%02d.%06ld,%s,%s,%s\r\n",
             tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
             tm->tm_hour, tm->tm_min, tm->tm_sec,
+            (long)e.tv.tv_usec,
             e.level, e.event, e.message);
         size_t written = f.print(line);
         totalWritten += written;
@@ -302,21 +309,26 @@ void GatewayLogger::removeOldLogs() {
     time_t now = time(nullptr);
     File root = LittleFS.open("/");
     File file = root.openNextFile();
+    int removedCount = 0;
     while (file) {
         String name = file.name();
-        if (name.startsWith("/log_")) {
+        if (name.startsWith("/log_") || name.startsWith("log_")) {
+            String fullName = name.startsWith("/") ? name : ("/" + name);
+            // Extract date from /log_YYYYMMDD[_N].txt
             int y, m, d;
-            if (sscanf(name.c_str(), "/log_%4d%2d%2d.txt", &y, &m, &d) == 3) {
+            if (sscanf(fullName.c_str(), "/log_%4d%2d%2d", &y, &m, &d) == 3) {
                 struct tm tm = {0};
                 tm.tm_year = y - 1900;
                 tm.tm_mon = m - 1;
                 tm.tm_mday = d;
                 time_t fileTime = mktime(&tm);
                 if ((now - fileTime) > (retentionDays * 86400L)) {
-                    LittleFS.remove(name);
+                    LittleFS.remove(fullName);
+                    removedCount++;
                 }
             }
         }
         file = root.openNextFile();
     }
+    Serial.printf("[Logger] removeOldLogs: Removed %d old log files.\r\n", removedCount);
 }
