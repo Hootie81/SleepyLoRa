@@ -29,8 +29,8 @@
 
 #define EN_PIN 4
 
-#define CLOSED_RAW 0 //19
-#define OPEN_RAW 1000 //860
+//#define CLOSED_RAW 0 //19
+//#define OPEN_RAW 1000 //860
 
 time_t disengage_time = 1000;
 time_t stroke_time = 14000; // time for full stroke
