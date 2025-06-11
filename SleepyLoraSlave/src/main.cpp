@@ -85,12 +85,15 @@ bool configPortalActive = false;
 unsigned long configPortalStartTime = 0;
 
 #define POS_ALPHA 0.7
-#define CLOSED_RAW 5 //19
-#define OPEN_RAW 1600 //860
+uint16_t closed_raw = 1600; // Default CLOSED_RAW
+uint16_t open_raw = 5;      // Default OPEN_RAW
 uint8_t blind_state = STATE_CLOSED;
 uint16_t blind_position = 0; // 0-1000
 uint16_t targetPos;  // position in % x 10
 Ewma posEwma(POS_ALPHA);
+
+int cached_raw_position = 0;
+uint16_t cached_scaled_position = 0;
 
 time_t disengage_time = 1000;
 time_t stroke_time = 14000; // time for full stroke
@@ -149,11 +152,61 @@ void sendUARTResponse(uint8_t command, uint8_t *payload) {
     RS485_RECEIVE();
 }
 
+void loadRawLimitsFromFlash() {
+    prefs.begin("blindcfg", true);
+    closed_raw = prefs.getUShort("closed_raw", 1600);
+    open_raw = prefs.getUShort("open_raw", 5);
+    prefs.end();
+}
+
+void saveRawLimitsToFlash(uint16_t closed, uint16_t open) {
+    prefs.begin("blindcfg", false);
+    prefs.putUShort("closed_raw", closed);
+    prefs.putUShort("open_raw", open);
+    prefs.end();
+}
+
+void handleSetClosedLimit(AsyncWebServerRequest *request) {
+    int raw = readPositionRaw();
+    LOG_INFO("[WEB] Set Closed Limit requested. Current raw: %d, Open raw: %d\n", raw, open_raw);
+    if (abs(raw - open_raw) < 100) {
+        LOG_WARN("[WEB] Closed limit validation failed: difference < 100 or equal.\n");
+        request->send(400, "text/html",
+            "<html><body>Error: Closed and Open limits must differ by at least 100 raw units and cannot be equal.<br>"
+            "<a href='/'>Back</a></body></html>");
+        return;
+    }
+    closed_raw = raw;
+    saveRawLimitsToFlash(closed_raw, open_raw);
+    LOG_INFO("[WEB] Closed limit set to %d and saved to flash.\n", closed_raw);
+    request->send(200, "text/html",
+        "<html><body>Closed limit set to current position (" + String(raw) + ").<br><a href='/'>Back</a></body></html>");
+}
+
+void handleSetOpenLimit(AsyncWebServerRequest *request) {
+    int raw = readPositionRaw();
+    LOG_INFO("[WEB] Set Open Limit requested. Current raw: %d, Closed raw: %d\n", raw, closed_raw);
+    if (abs(closed_raw - raw) < 100) {
+        LOG_WARN("[WEB] Open limit validation failed: difference < 100 or equal.\n");
+        request->send(400, "text/html",
+            "<html><body>Error: Closed and Open limits must differ by at least 100 raw units and cannot be equal.<br>"
+            "<a href='/'>Back</a></body></html>");
+        return;
+    }
+    open_raw = raw;
+    saveRawLimitsToFlash(closed_raw, open_raw);
+    LOG_INFO("[WEB] Open limit set to %d and saved to flash.\n", open_raw);
+    request->send(200, "text/html",
+        "<html><body>Open limit set to current position (" + String(raw) + ").<br><a href='/'>Back</a></body></html>");
+}
+
 uint16_t readPosition(void) {
   int posAvg = readPositionRaw();
-  long posCalc = map(posAvg, CLOSED_RAW, OPEN_RAW, 0, 1000);  // based on 390k and 100k voltage divider
+  cached_raw_position = posAvg;
+  long posCalc = map(posAvg, closed_raw, open_raw, 0, 1000);  // based on 390k and 100k voltage divider
   uint16_t posConst = constrain(posCalc, 0, 1000);
-  LOG_DEBUG("Blind Position: %u\r\n", posConst);
+  cached_scaled_position = posConst;
+  LOG_DEBUG("  Blind Position: %u\r\n", posConst);
   return posConst;
 }
 
@@ -162,7 +215,7 @@ int readPositionRaw(void) {
 
   int posRaw = analogReadMilliVolts(POSITION_PIN);
   posAvg = posEwma.filter(posRaw);
-
+  LOG_DEBUG("RAW Position: %u  ", posAvg);
   return posAvg;
 }
 
@@ -171,8 +224,13 @@ void run_motor(uint8_t dir, int runtime) {
   uint16_t calcPos = readPosition();
   LOG_DEBUG("Current Position: %.1f%% Target Position: %.1f%%\r\n", calcPos / 10.0f, targetPos / 10.0f);
   if (dir == 0x01) {
-    digitalWrite(IN_A_PIN, HIGH);
-    digitalWrite(IN_B_PIN, LOW);
+    if (closed_raw < open_raw) {
+        digitalWrite(IN_A_PIN, HIGH);
+        digitalWrite(IN_B_PIN, LOW); 
+    } else {
+        digitalWrite(IN_A_PIN, LOW);
+        digitalWrite(IN_B_PIN, HIGH);
+    }
     LOG_DEBUG("Motor Started Retract\r\n");
     if (motor_engaged) {
       blind_state = STATE_CLOSING;
@@ -180,8 +238,13 @@ void run_motor(uint8_t dir, int runtime) {
     last_motor_dir = true;
   }
   if (dir == 0x02) {
-    digitalWrite(IN_A_PIN, LOW);
-    digitalWrite(IN_B_PIN, HIGH);
+    if (closed_raw < open_raw) {
+        digitalWrite(IN_A_PIN, LOW);
+        digitalWrite(IN_B_PIN, HIGH); 
+    } else {
+        digitalWrite(IN_A_PIN, HIGH);
+        digitalWrite(IN_B_PIN, LOW);
+    }
     LOG_DEBUG("Motor Started Extend\r\n");
     if (motor_engaged) {
       blind_state = STATE_OPENING;
@@ -260,6 +323,16 @@ uint8_t loadLastMoveStatusFromFlash() {
     return status;
 }
 
+void handleGetPosition(AsyncWebServerRequest *request) {
+    char json[64];
+    snprintf(json, sizeof(json),
+        "{\"raw\":%d,\"percent\":%.1f}",
+        cached_raw_position,
+        cached_scaled_position / 10.0f
+    );
+    request->send(200, "application/json", json);
+}
+
 void handleConfigPage(AsyncWebServerRequest *request) {
     char html[4096];
     snprintf(html, sizeof(html),
@@ -274,6 +347,16 @@ void handleConfigPage(AsyncWebServerRequest *request) {
         "                  |_|    |___/                       \r\n"
         "</pre>"
         "<h2 style='text-align:center;margin:0 0 18px 0;'>SleepyLora Slave Config</h2>"
+        "<div id='livepos' style='text-align:center;font-size:1.1em;margin-bottom:16px;'>"
+        "Raw Position: <span id='rawpos'>...</span>  Blind Position: <span id='blindpos'>...</span>%%"
+        "</div>"
+        "<form method='POST' action='/set_closed' style='margin-top:10px;'>"
+        "<button type='submit' style='background:#ffc107;color:#222;font-size:1.1em;padding:8px 24px;border:none;border-radius:6px;cursor:pointer;width:100%%;'>Set Closed Limit (Current Position)</button>"
+        "</form>"
+        "<form method='POST' action='/set_open' style='margin-top:10px;'>"
+        "<button type='submit' style='background:#17a2b8;color:#fff;font-size:1.1em;padding:8px 24px;border:none;border-radius:6px;cursor:pointer;width:100%%;'>Set Open Limit (Current Position)</button>"
+        "</form>"
+        "<hr style='margin:18px 0; border:0; border-top:2px solid #eee;'>"
         "<form method='POST' action='/save'>"
         "<label>Slave Number:</label><br>"
         "<select name='slave_number' style='width:100%%;padding:6px;margin-bottom:10px;'>"
@@ -292,12 +375,24 @@ void handleConfigPage(AsyncWebServerRequest *request) {
         "</select><br>"
         "<button type='submit' style='background:#28a745;color:#fff;font-size:1.2em;padding:10px 32px;border:none;border-radius:6px;cursor:pointer;margin-top:10px;width:100%%;'>Save</button>"
         "</form>"
+        "<hr style='margin:18px 0; border:0; border-top:2px solid #eee;'>"
         "<div style='margin-top:18px; text-align:center;'>"
         "<a href='/upload' style='color:#007bff; font-size:1.1em; text-decoration:underline;'>Update Firmware from File</a>"
         "</div>"
+        "<hr style='margin:18px 0; border:0; border-top:2px solid #eee;'>"
         "<form method='POST' action='/close' style='margin-top:18px; text-align:center;'>"
         "<button type='submit' style='background:#dc3545;color:#fff;font-size:1.1em;padding:8px 24px;border:none;border-radius:6px;cursor:pointer;'>Close Web Portal & Sleep</button>"
         "</form>"
+        "<script>"
+        "function updatePos() {"
+        "  fetch('/position').then(r=>r.json()).then(d=>{"
+        "    document.getElementById('rawpos').textContent = d.raw;"
+        "    document.getElementById('blindpos').textContent = d.percent.toFixed(1);"
+        "  });"
+        "}"
+        "setInterval(updatePos, 1000);"
+        "updatePos();"
+        "</script>"
         "</div></body></html>",
         (slave_number == 1 ? " selected" : ""),
         (slave_number == 2 ? " selected" : ""),
@@ -311,6 +406,7 @@ void handleConfigPage(AsyncWebServerRequest *request) {
         (slave_number == 10 ? " selected" : ""),
         (slave_number == 11 ? " selected" : ""),
         (slave_number == 12 ? " selected" : "")
+
     );
     request->send(200, "text/html", html);
 }
@@ -409,7 +505,9 @@ void startConfigAPAndWebserver() {
             stopConfigAPAndWebserver();
         });
     });
-
+    server.on("/set_closed", HTTP_POST, handleSetClosedLimit);
+    server.on("/set_open", HTTP_POST, handleSetOpenLimit);
+    server.on("/position", HTTP_GET, handleGetPosition);
     server.begin();
     configPortalActive = true;
     configPortalStartTime = millis();
@@ -500,7 +598,7 @@ void setup() {
     slave_number = prefs.getUChar("slave_number", 1);
     prefs.end();
     rs485_addr = BASE_ADDR + (slave_number - 1);
-
+    loadRawLimitsFromFlash();
     Serial.begin(115200);
     pinMode(RS485_DIR_PIN, OUTPUT);
     RS485_RECEIVE(); // Default to receive mode
