@@ -109,6 +109,10 @@ void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties 
             if (set_state != 0xFF) {
                 gettimeofday(&tv_now, NULL);
                 int32_t time = (int32_t)tv_now.tv_sec;
+                if (TXbuffer.isFull()) {
+                    Logger.log("WARN", "LORA_TX", "TXbuffer full, dropping oldest and queueing BLIND_COMMAND");
+                    TXbuffer.shift();
+                }
                 TXbuffer.push(data::TXpacket{ time, deviceId, BLIND_COMMAND, blindNumber, set_state, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
                 Serial.printf("Pushed BLIND_COMMAND to TXbuffer: deviceId=%08X, blindNumber=%u, set_state=0x%02X\r\n", deviceId, blindNumber, set_state);
                 Logger.log("INFO", "MQTT_CMD", "BLIND_COMMAND: deviceId=%08X, blindNumber=%u, set_state=0x%02X", deviceId, blindNumber, set_state);
@@ -117,12 +121,20 @@ void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties 
             int setPosition = atoi(msg);
             gettimeofday(&tv_now, NULL);
             int32_t time = (int32_t)tv_now.tv_sec;
+            if (TXbuffer.isFull()) {
+                Logger.log("WARN", "LORA_TX", "TXbuffer full, dropping oldest and queueing SET_POSITION");
+                TXbuffer.shift();
+            }
             TXbuffer.push(data::TXpacket{ time, deviceId, BLIND_COMMAND, blindNumber, 0x04, (uint8_t)setPosition, 0x00, 0x00, 0x00, 0x00, 0x00 });
             Serial.printf("Pushed BLIND_COMMAND (set position) to TXbuffer: deviceId=%08X, blindNumber=%u, setPosition=%d\r\n", deviceId, blindNumber, setPosition);
             Logger.log("INFO", "MQTT_CMD", "SET_POSITION: deviceId=%08X, blindNumber=%u, setPosition=%d", deviceId, blindNumber, setPosition);
         } else if (strcmp(type, "startAP") == 0) {
             gettimeofday(&tv_now, NULL);
             int32_t time = (int32_t)tv_now.tv_sec;
+            if (TXbuffer.isFull()) {
+                Logger.log("WARN", "LORA_TX", "TXbuffer full, dropping oldest and queueing UPDATE_FIRMWARE");
+                TXbuffer.shift();
+            }
             TXbuffer.push(data::TXpacket{ time, deviceId, UPDATE_FIRMWARE, blindNumber, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
             Serial.printf("Pushed UPDATE_FIRMWARE (open web portal) to TXbuffer: deviceId=%08X, blindNumber=%u\r\n", deviceId, blindNumber);
             Logger.log("INFO", "MQTT_CMD", "UPDATE_FIRMWARE: deviceId=%08X, blindNumber=%u", deviceId, blindNumber);

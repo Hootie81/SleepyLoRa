@@ -84,9 +84,9 @@
 #define MAX_SLAVES 12    // Adjust as needed
 
 // UART protocol constants
-#define RS485_DIR_PIN 38
-#define UART_TX_PIN     45
-#define UART_RX_PIN      46
+#define RS485_DIR_PIN 39
+#define UART_TX_PIN     46
+#define UART_RX_PIN      45
 #define RS485_TRANSMIT()  digitalWrite(RS485_DIR_PIN, HIGH)
 #define RS485_RECEIVE()   digitalWrite(RS485_DIR_PIN, LOW)
 #define UART_START_BYTE 0xAA

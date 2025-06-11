@@ -6,6 +6,7 @@
 #pragma once
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <sys/time.h>
 
 #define LOG_BUFFER_SIZE 32  // Number of log entries in RAM buffer
 #define LOG_ENTRY_MAXLEN 192
@@ -13,7 +14,7 @@
 #define LOG_RETENTION_DEFAULT 7 // days
 
 struct LogEntry {
-    time_t timestamp;
+    struct timeval tv; // microsecond timestamp
     char level[8];
     char event[16];
     char message[LOG_ENTRY_MAXLEN];

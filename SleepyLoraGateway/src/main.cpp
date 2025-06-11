@@ -274,11 +274,10 @@ void setup() {
 
 void loop() {
   Watchdog.reset();
-  checkConfigButton(); // Initial check before loop
+  checkConfigButton();
   if (shouldStartConfig) {
       WiFi.disconnect(true);
       startConfigPortalAP();
-      // Web server is already running, so portal is available on AP too
       while (true) {
           checkConfigButton();
           if (shouldClearConfig) {
@@ -334,6 +333,8 @@ void loop() {
         Serial.print(labs(timeDelta));
         Serial.print(" sec ");
         Serial.println(direction);
+        // If time changed significantly, flush and close the current log file to ensure new logs go to the correct file
+        Logger.flush();
       }
       tv_now.tv_sec = timeSet;
       settimeofday(&tv_now, NULL);
@@ -342,14 +343,16 @@ void loop() {
   if (pendingTx.awaitingAck && !TXbuffer.isEmpty()) {
     if (millis() - pendingTx.lastSendTime > 750) { // timeout
         if (pendingTx.retryCount < 3) {
-            Serial.println("No ACK, resending...");
-            Logger.log("WARN", "LORA_ACK", "No ACK, resending, node=0x%08X, retry=%u", pendingTx.awaitingNodeId, pendingTx.retryCount+1);
-            sendPacket(); // Resend the same packet
+            Logger.log("DEBUG", "LORA_ACK", "No ACK, resending, retry=%u, node=0x%08X", pendingTx.retryCount+1, pendingTx.awaitingNodeId);
+            Serial.printf("No ACK, resending packet, retry=%u, node=0x%08X\n", pendingTx.retryCount + 1, pendingTx.awaitingNodeId);
             pendingTx.lastSendTime = millis();
             pendingTx.retryCount++;
+            digitalWrite(LED_PIN, HIGH);
+            sendPacket();
+            digitalWrite(LED_PIN, LOW);
         } else {
-            Serial.println("No ACK after 3 tries, discarding message.");
-            Logger.log("ERROR", "LORA_ACK", "No ACK after 3 tries, discarding, node=0x%08X", pendingTx.awaitingNodeId);
+            Logger.log("DEBUG", "LORA_ACK", "No ACK after 3 tries, discarding, node=0x%08X", pendingTx.awaitingNodeId);
+            Serial.printf("No ACK after 3 tries, discarding packet for node=0x%08X\n", pendingTx.awaitingNodeId);
             TXbuffer.shift();
             pendingTx.awaitingAck = false;
             pendingTx.retryCount = 0;
@@ -382,6 +385,24 @@ void loop() {
       ESP.restart();
     }
   }
+
+  // Diagnostics: log TX/RX buffer and state
+  static unsigned long lastDiagLog = 0;
+  if (millis() - lastDiagLog > 5000) { // every 5 seconds
+    Logger.log("DEBUG", "LORA_STATE", "pendingTx.awaitingAck=%d, txComplete=%d, TXbuffer.size=%d, RXbuffer.size=%d", (int)pendingTx.awaitingAck, (int)txComplete, (int)TXbuffer.size(), (int)RXbuffer.size());
+    lastDiagLog = millis();
+  }
+
+  // Global TX stuck watchdog
+  if (!txComplete) {
+    unsigned long txElapsedMs = (micros() - loraTXTime) / 1000UL;
+    if (txElapsedMs > TX_TIMEOUT_VALUE) {
+      Logger.log("WARN", "LORA_RADIO", "TX stuck: txComplete=false for %lums (>TX_TIMEOUT_VALUE=%dms), forcing true", txElapsedMs, TX_TIMEOUT_VALUE);
+      Serial.printf("WARNING: TX stuck, forcing txComplete=true after %lums\n", txElapsedMs);
+      txComplete = true;
+      // Optionally, reset radio or take further recovery action here
+    }
+  }
 }
 
 void connectToWifi() { WiFi.begin(config.wifi_ssid, config.wifi_pass); }
@@ -402,7 +423,7 @@ void onWifiEvent(WiFiEvent_t event) {
 }
 
 void sendPacket() {
-  if (!txComplete && !pendingTx.awaitingAck) {
+  if (!txComplete) {
     return;
   }
 
@@ -601,6 +622,10 @@ void decodePacket(void) {
     if ((uint8_t)RXbuffer.first().command != TIME_SYNC_COMMAND) {  // only a time sync request is allowed on failed OTP
       // send a NAK, the device should request timesync then resend whatever..
       Serial.println(" Not a time sync request, Sending Nak ");
+      if (TXbuffer.isFull()) {
+        Logger.log("WARN", "LORA_TX", "TXbuffer full, dropping oldest and queueing NAK");
+        TXbuffer.shift();
+      }
       TXbuffer.push(data::TXpacket{ time, RXbuffer.first().nodeFromId,  NAK,
                                     (uint8_t)random(0, 255), (uint8_t)random(0, 255), (uint8_t)random(0, 255),
                                     (uint8_t)random(0, 255), (uint8_t)random(0, 255), (uint8_t)random(0, 255),
@@ -636,6 +661,10 @@ void decodePacket(void) {
     currentTime[2] = time >> 8;
     currentTime[3] = time;
 
+    if (TXbuffer.isFull()) {
+      Logger.log("WARN", "LORA_TX", "TXbuffer full, dropping oldest and queueing TIME_SYNC_COMMAND");
+      TXbuffer.shift();
+    }
     TXbuffer.push(data::TXpacket{ timeSet, RXbuffer.first().nodeFromId, TIME_SYNC_COMMAND,
                                   (uint8_t)time, (uint8_t)(time >> 8),
                                   (uint8_t)(time >> 16), (uint8_t)(time >> 24),
@@ -742,6 +771,9 @@ void decodePacket(void) {
       case 0x02:
         Serial.print("TIMEOUT");
         break;
+      case 0x03:
+        Serial.print("MOVING");
+        break;
       default:
         Serial.printf("Unknown (0x%02X)", moveStatus);
     }
@@ -814,7 +846,6 @@ void checkBlindAvailability() {
         }
     }
 }
-
 /*****************************************************************************************************************
 
 Radio Setup, Sleep and Callbacks section
@@ -992,6 +1023,7 @@ void OnTxDone(void) {
   Radio.Rx(0);
   Serial.print("  Set RX mode - Radio Status: ");
   Serial.println(Radio.GetStatus());
+  Logger.log("DEBUG", "LORA_RADIO", "OnTxDone: txComplete=%d, TXbuffer.size=%d", (int)txComplete, (int)TXbuffer.size());
 }
 
 /**@brief Function to be executed on Radio Tx Timeout event */
@@ -1000,6 +1032,7 @@ void OnTxTimeout(void) {
   Serial.println(Radio.GetStatus());
   lastTX = millis();
   txComplete = true;
+  Logger.log("ERROR", "LORA_RADIO", "OnTxTimeout: txComplete=%d, TXbuffer.size=%d", (int)txComplete, (int)TXbuffer.size());
 }
 
 /**@Function for channel activity detection and TX packet*/
