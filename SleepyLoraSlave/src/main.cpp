@@ -47,6 +47,7 @@
 #define POSITION_PIN 4
 #define IN_A_PIN 10
 #define IN_B_PIN 20
+#define EN_PIN 7
 
 // RS485 direction control pin for slave
 #define RS485_DIR_PIN 8
@@ -187,6 +188,7 @@ void run_motor(uint8_t dir, int runtime) {
     }
     last_motor_dir = false;
   }
+  digitalWrite(EN_PIN, HIGH);
   motor_running = true;
   motor_start_time = millis();
   motor_run_time = runtime;
@@ -240,6 +242,7 @@ void update_motor(void) {
 void stop_motor(void) {
   digitalWrite(IN_A_PIN, LOW);
   digitalWrite(IN_B_PIN, LOW);
+  digitalWrite(EN_PIN, LOW);
   motor_running = false;
   return;
 }
@@ -489,8 +492,10 @@ bool isAddressInUse(uint8_t candidate_addr) {
 void setup() {
     pinMode(IN_A_PIN, OUTPUT);
     pinMode(IN_B_PIN, OUTPUT);
+    pinMode(EN_PIN, OUTPUT);
     digitalWrite(IN_A_PIN, LOW);
     digitalWrite(IN_B_PIN, LOW);
+    digitalWrite(EN_PIN, LOW);
     prefs.begin("slavecfg", true);
     slave_number = prefs.getUChar("slave_number", 1);
     prefs.end();
@@ -575,11 +580,16 @@ void loop() {
                             saveLastMoveStatusToFlash(last_move_status);
                             run_motor((targetPos < calcPos) ? 0x01 : 0x02, disengage_time + (abs(targetPos - calcPos) * stroke_time / 1000) + 5000);
                         }
-                        LOG_DEBUG("[UART TX] BLIND_COMMAND echo: ");
-                        for (int i = 0; i < 8; ++i) LOG_DEBUG_RAW("%02X ", payload[i]);
+                        uint8_t status_payload[8] = {0};
+                        status_payload[0] = blind_state;
+                        status_payload[1] = (blind_position >> 8) & 0xFF;
+                        status_payload[2] = blind_position & 0xFF;
+                        status_payload[7] = last_move_status; // Add last_move_status to byte 7
+                        LOG_DEBUG("[UART TX] BLIND_COMMAND status response: ");
+                        for (int i = 0; i < 8; ++i) LOG_DEBUG_RAW("%02X ", status_payload[i]);
                         LOG_DEBUG_RAW("\r\n");
-                        sendUARTResponse(BLIND_COMMAND, payload); // Echo for debug
-                        LOG_DEBUG("[UART TX] Sent BLIND_COMMAND frame\r\n");
+                        sendUARTResponse(GET_STATUS, status_payload);
+                        LOG_DEBUG("[UART TX] Sent BLIND_COMMAND status frame\r\n");
                     } else if (command == UPDATE_FIRMWARE) {
                         LOG_DEBUG("[UART TX] UPDATE_FIRMWARE command received, starting OTA...\r\n");
                         startConfigAPAndWebserver();
