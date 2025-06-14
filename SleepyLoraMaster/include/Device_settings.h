@@ -16,9 +16,10 @@
 #define BATTERY_ADC_PIN 01
 #define VEXT_PIN 36
 #define POSITION_PIN 7
+#define POSITION_REF_PIN 15 // GPIO15: Pot top (reference)
 
-#define POS_ALPHA 0.3
-#define BATT_ALPHA 0.3
+#define POS_ALPHA 1
+#define BATT_ALPHA 0.7
 
 #define LED_PIN 35
 
