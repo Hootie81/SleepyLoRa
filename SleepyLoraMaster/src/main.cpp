@@ -529,7 +529,6 @@ void setVBATKeepOn(unsigned long duration_ms) {
 void updateVBATState() {
   if (!motor_running && !any_slave_moving() && !slave_reading && millis() > vbat_keep_on_until) {
       vBAT(false);
-      vEXT(false); // Turn off logic shifter when vBAT is off and not needed
   } 
 }
 
@@ -1013,6 +1012,8 @@ void setup() {
 
   analogSetPinAttenuation(POSITION_PIN, ADC_11db);  // Sets the input attenuation, default is ADC_11db, range is ADC_0db, ADC_2_5db, ADC_6db, ADC_11db
   adcAttachPin(POSITION_PIN);
+  analogSetPinAttenuation(POSITION_REF_PIN, ADC_11db);  // Sets the input attenuation, default is ADC_11db, range is ADC_0db, ADC_2_5db, ADC_6db, ADC_11db
+  adcAttachPin(POSITION_REF_PIN);
 
   // Slowing down the ESP32 to 1/4 of its speed saves more energy
   setCpuFrequencyMhz(80);
@@ -1193,7 +1194,7 @@ bool vEXT(bool vext_set_state) {
     digitalWrite(VEXT_PIN, LOW);
     vext_state = true;
     LOG_INFO("vEXT Enabled\r\n");
-    delay(100);
+    delay(250);
     return true;
   }
   if (!vext_set_state && vext_state) {
@@ -1215,25 +1216,28 @@ uint16_t readPosition(void) {
   long posCalc = map(posAvg, closed_raw, open_raw, 0, 1000);  // based on 390k and 100k voltage divider
   uint16_t posConst = constrain(posCalc, 0, 1000);
   cached_scaled_position = posConst;
+
+  LOG_INFO("Position update: Raw Pos=%u, Calc Pos=%u\r\n", cached_raw_position, cached_scaled_position);
   return posConst;
 }
 
 int readPositionRaw(void) {
-  vEXT(true);
-  int posAvg;
-  if (SIMULATOR) {
-    if (motor_running == true && last_motor_dir && motor_engaged) {
-      posSIM = posSIM - 1;
-    }
-    if (motor_running == true && !last_motor_dir && motor_engaged) {
-      posSIM = posSIM + 1;
-    }
-    posAvg = posEwma.filter(posSIM / 150);
-  } else {
-    int posRaw = analogReadMilliVolts(POSITION_PIN);
-    posAvg = posEwma.filter(posRaw);
-  }
-  return posAvg;
+    vEXT(true); // Ensure sensor power is on
+
+    int raw_wiper = analogReadMilliVolts(POSITION_PIN);      // Wiper voltage
+    int raw_ref   = analogReadMilliVolts(POSITION_REF_PIN);  // Reference voltage (top of pot)
+
+    // Prevent divide by zero or very low reference
+    if (raw_ref < 100) raw_ref = 100;
+
+    // Normalize wiper reading to 1.65V reference
+    int normalized = (raw_wiper * 1650) / raw_ref;
+
+    int posAvg = posEwma.filter(normalized);
+
+    LOG_INFO("Raw wiper: %d mV, Raw ref: %d mV, Normalized: %d mV\r\n", raw_wiper, raw_ref, normalized);
+
+    return posAvg;
 }
 
 // set a direction and a max/estimated runtime, motor stop may be called once position reached
@@ -1287,8 +1291,19 @@ void update_motor(void) {
   if (motor_running) {
     last_move_status = MOVE_STATUS_MOVING;
     uint16_t calcPos = readPosition();
-    if (motor_engaged && (abs(targetPos - calcPos) < 1 || (!last_motor_dir && calcPos > targetPos) || (last_motor_dir && calcPos < targetPos))) {
-      //target acheived
+    const int tolerance = 5; // 0.5% of full range
+
+    bool achieved = false;
+    LOG_INFO("Motor update: calcPos=%u, targetPos=%u, last_motor_dir=%d, closed_raw=%u, open_raw=%u\r\n", calcPos, targetPos, last_motor_dir, closed_raw, open_raw);
+    if (last_motor_dir) { // closing
+      if (calcPos <= targetPos + tolerance) achieved = true;
+    } else { // opening
+      if (calcPos >= targetPos - tolerance) achieved = true;
+    }
+
+
+    if (motor_engaged && achieved) {
+      // target achieved
       LOG_INFO(" position achieved\r\n");
       LOG_INFO("Current Position: %.1f%% Target Position: %.1f%% Time taken to move: %lu\r\n", calcPos / 10.0f, targetPos / 10.0f, millis() - motor_start_time);
       if (calcPos > 10) {
@@ -1902,6 +1917,7 @@ void radioInit(void) {
 
 void goToSleep(void) {
   LOG_INFO("Going to sleep...\r\n");
+  vEXT(false); // Turn off logic shifter
   // Start waiting for data package
   Radio.Standby();
   SX126xSetDioIrqParams(IRQ_RX_DONE | IRQ_RX_TX_TIMEOUT, IRQ_RX_DONE | IRQ_RX_TX_TIMEOUT, IRQ_RADIO_NONE, IRQ_RADIO_NONE);
