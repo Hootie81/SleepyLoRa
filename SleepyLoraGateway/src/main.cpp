@@ -340,6 +340,11 @@ void loop() {
       settimeofday(&tv_now, NULL);
     }
   }
+    while (!RXbuffer.isEmpty()) {
+      digitalWrite(LED_PIN, HIGH);
+      decodePacket();
+      digitalWrite(LED_PIN, LOW);
+  }
   if (pendingTx.awaitingAck && !TXbuffer.isEmpty()) {
     if (millis() - pendingTx.lastSendTime > 750) { // timeout
         if (pendingTx.retryCount < 3) {
@@ -360,11 +365,7 @@ void loop() {
         }
     }
   }
-  if (!RXbuffer.isEmpty()) {
-    digitalWrite(LED_PIN, HIGH);
-    decodePacket();
-    digitalWrite(LED_PIN, LOW);
-  }
+
   if (!TXbuffer.isEmpty() && !pendingTx.awaitingAck && (millis() - lastTX > INTER_MESSAGE_DELAY)) {
     digitalWrite(LED_PIN, HIGH);
     sendPacket();
