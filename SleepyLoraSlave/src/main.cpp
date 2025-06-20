@@ -16,6 +16,7 @@
 #include <ESPAsyncWebServer.h>
 #include <Update.h>
 #include <Ticker.h>
+#include <nvs_flash.h>
 
 // Debug macros with log levels
 #define DEBUG_SERIAL
@@ -106,6 +107,12 @@ uint8_t last_move_status; // New variable to track last move status
 
 Preferences prefs;
 
+// PWM control variables and defaults
+#define EN_PWM_CHANNEL 0
+#define EN_PWM_RESOLUTION 8 // 8 bits (0-255)
+uint32_t pwm_freq = 1000; // Default 1kHz
+uint8_t pwm_duty = 255;   // Default 100% (255/255)
+
 void run_motor(uint8_t dir, int runtime);
 void disengage_motor(void);
 uint16_t readPosition(void);
@@ -152,15 +159,51 @@ void sendUARTResponse(uint8_t command, uint8_t *payload) {
     RS485_RECEIVE();
 }
 
+void eraseNVSAndReboot() {
+    LOG_ERROR("[NVS] Erasing NVS partition and rebooting...\n");
+    nvs_flash_erase();
+    nvs_flash_init();
+    delay(100);
+    ESP.restart();
+}
+
 void loadRawLimitsFromFlash() {
-    prefs.begin("blindcfg", true);
-    closed_raw = prefs.getUShort("closed_raw", 1600);
-    open_raw = prefs.getUShort("open_raw", 5);
+    LOG_INFO("[NVS] Loading raw limits from flash...\n");
+    if (!prefs.begin("blindcfg", false)) {
+        LOG_ERROR("[NVS] Failed to open 'blindcfg' namespace for reading!\n");
+        eraseNVSAndReboot();
+    }
+    bool needSave = false;
+    if (!prefs.isKey("closed_raw")) {
+        LOG_WARN("[NVS] 'closed_raw' key missing, using default 1600.\n");
+        closed_raw = 1600;
+        needSave = true;
+    } else {
+        closed_raw = prefs.getUShort("closed_raw", 1600);
+        LOG_INFO("[NVS] Loaded closed_raw: %u\n", closed_raw);
+    }
+    if (!prefs.isKey("open_raw")) {
+        LOG_WARN("[NVS] 'open_raw' key missing, using default 5.\n");
+        open_raw = 5;
+        needSave = true;
+    } else {
+        open_raw = prefs.getUShort("open_raw", 5);
+        LOG_INFO("[NVS] Loaded open_raw: %u\n", open_raw);
+    }
+    if (needSave) {
+        LOG_INFO("[NVS] Saving default raw limits to flash.\n");
+        prefs.putUShort("closed_raw", closed_raw);
+        prefs.putUShort("open_raw", open_raw);
+    }
     prefs.end();
 }
 
 void saveRawLimitsToFlash(uint16_t closed, uint16_t open) {
-    prefs.begin("blindcfg", false);
+    LOG_INFO("[NVS] Saving raw limits to flash: closed_raw=%u, open_raw=%u\n", closed, open);
+    if (!prefs.begin("blindcfg", false)) {
+        LOG_ERROR("[NVS] Failed to open 'blindcfg' namespace for writing!\n");
+        eraseNVSAndReboot();
+    }
     prefs.putUShort("closed_raw", closed);
     prefs.putUShort("open_raw", open);
     prefs.end();
@@ -251,7 +294,8 @@ void run_motor(uint8_t dir, int runtime) {
     }
     last_motor_dir = false;
   }
-  digitalWrite(EN_PIN, HIGH);
+  // Use PWM for EN_PIN
+  ledcWrite(EN_PWM_CHANNEL, pwm_duty);
   motor_running = true;
   motor_start_time = millis();
   motor_run_time = runtime;
@@ -305,20 +349,33 @@ void update_motor(void) {
 void stop_motor(void) {
   digitalWrite(IN_A_PIN, LOW);
   digitalWrite(IN_B_PIN, LOW);
-  digitalWrite(EN_PIN, LOW);
+  ledcWrite(EN_PWM_CHANNEL, 0); // Stop PWM
   motor_running = false;
   return;
 }
 
 void saveLastMoveStatusToFlash(uint8_t status) {
+    LOG_INFO("[NVS] Saving last_move_status to flash: %u\n", status);
     prefs.begin("blindcfg", false);
     prefs.putUChar("lms", status); // key shortened to fit NVS requirements
     prefs.end();
 }
 
 uint8_t loadLastMoveStatusFromFlash() {
-    prefs.begin("blindcfg", true);
-    uint8_t status = prefs.getUChar("lms", 0); // key shortened to fit NVS requirements
+    LOG_INFO("[NVS] Loading last_move_status from flash...\n");
+    if (!prefs.begin("blindcfg", false)) {
+        LOG_ERROR("[NVS] Failed to open 'blindcfg' namespace for reading!\n");
+        eraseNVSAndReboot();
+    }
+    uint8_t status = 0;
+    if (!prefs.isKey("lms")) {
+        LOG_WARN("[NVS] 'lms' key missing, using default 0.\n");
+        status = 0;
+        prefs.putUChar("lms", status);
+    } else {
+        status = prefs.getUChar("lms", 0);
+        LOG_INFO("[NVS] Loaded last_move_status: %u\n", status);
+    }
     prefs.end();
     return status;
 }
@@ -333,9 +390,84 @@ void handleGetPosition(AsyncWebServerRequest *request) {
     request->send(200, "application/json", json);
 }
 
+void savePWMSettingsToFlash(uint32_t freq, uint8_t duty) {
+    LOG_INFO("[NVS] Saving PWM settings to flash: freq=%u, duty=%u\n", freq, duty);
+    if (!prefs.begin("blindcfg", false)) {
+        LOG_ERROR("[NVS] Failed to open 'blindcfg' namespace for writing!\n");
+        eraseNVSAndReboot();
+    }
+    prefs.putUInt("pwm_freq", freq);
+    prefs.putUChar("pwm_duty", duty);
+    prefs.end();
+}
+
+void loadPWMSettingsFromFlash() {
+    LOG_INFO("[NVS] Loading PWM settings from flash...\n");
+    if (!prefs.begin("blindcfg", false)) {
+        LOG_ERROR("[NVS] Failed to open 'blindcfg' namespace for reading!\n");
+        eraseNVSAndReboot();
+    }
+    bool needSave = false;
+    if (!prefs.isKey("pwm_freq")) {
+        LOG_WARN("[NVS] 'pwm_freq' key missing, using default 1000.\n");
+        pwm_freq = 1000;
+        needSave = true;
+    } else {
+        pwm_freq = prefs.getUInt("pwm_freq", 1000);
+        LOG_INFO("[NVS] Loaded pwm_freq: %u\n", pwm_freq);
+    }
+    if (!prefs.isKey("pwm_duty")) {
+        LOG_WARN("[NVS] 'pwm_duty' key missing, using default 255.\n");
+        pwm_duty = 255;
+        needSave = true;
+    } else {
+        pwm_duty = prefs.getUChar("pwm_duty", 255);
+        LOG_INFO("[NVS] Loaded pwm_duty: %u\n", pwm_duty);
+    }
+    if (needSave) {
+        LOG_INFO("[NVS] Saving default PWM settings to flash.\n");
+        prefs.putUInt("pwm_freq", pwm_freq);
+        prefs.putUChar("pwm_duty", pwm_duty);
+    }
+    prefs.end();
+}
+
+void setupPWM() {
+    ledcSetup(EN_PWM_CHANNEL, pwm_freq, EN_PWM_RESOLUTION);
+    ledcAttachPin(EN_PIN, EN_PWM_CHANNEL);
+    ledcWrite(EN_PWM_CHANNEL, pwm_duty);
+}
+
+void updatePWM(uint32_t freq, uint8_t duty) {
+    pwm_freq = freq;
+    pwm_duty = duty;
+    ledcSetup(EN_PWM_CHANNEL, pwm_freq, EN_PWM_RESOLUTION);
+    ledcWrite(EN_PWM_CHANNEL, pwm_duty);
+    savePWMSettingsToFlash(pwm_freq, pwm_duty);
+}
+
+void handleSetPWM(AsyncWebServerRequest *request) {
+    if (request->hasParam("pwm_freq", true) && request->hasParam("pwm_duty", true)) {
+        uint32_t freq = request->getParam("pwm_freq", true)->value().toInt();
+        uint8_t duty = request->getParam("pwm_duty", true)->value().toInt();
+        if (freq < 100 || freq > 20000 || duty > 255) {
+            request->send(400, "text/html", "<html><body>Invalid PWM values.<br><a href='/' >Back</a></body></html>");
+            return;
+        }
+        updatePWM(freq, duty);
+        request->send(200, "text/html", "<html><body>PWM settings updated.<br><a href='/' >Back</a></body></html>");
+    } else {
+        request->send(400, "text/html", "<html><body>Missing PWM parameters.<br><a href='/' >Back</a></body></html>");
+    }
+}
+
 void handleConfigPage(AsyncWebServerRequest *request) {
-    char html[4096];
-    snprintf(html, sizeof(html),
+    char *html = (char*)malloc(4096);
+    if (!html) {
+        request->send(500, "text/html", "Internal Error: Out of Memory");
+        return;
+    }
+    snprintf(html, 4096,
         "<html><body style='font-family:monospace; background:#f8f9fa; margin:0; padding:0;'>"
         "<div style='max-width:480px;margin:32px auto 0 auto;padding:24px 24px 16px 24px;background:#fff;border-radius:10px;box-shadow:0 2px 12px #0001;'>"
         "<pre style='font-family:monospace; font-size:16px; text-align:center; margin:0 0 12px 0;'>\r\n"
@@ -355,6 +487,13 @@ void handleConfigPage(AsyncWebServerRequest *request) {
         "</form>"
         "<form method='POST' action='/set_open' style='margin-top:10px;'>"
         "<button type='submit' style='background:#17a2b8;color:#fff;font-size:1.1em;padding:8px 24px;border:none;border-radius:6px;cursor:pointer;width:100%%;'>Set Open Limit (Current Position)</button>"
+        "</form>"
+        "<form method='POST' action='/set_pwm' style='margin-top:10px;'>"
+        "<label>PWM Frequency (Hz):</label><br>"
+        "<input type='number' name='pwm_freq' min='100' max='20000' value='%u' style='width:100%%;padding:6px;margin-bottom:8px;'><br>"
+        "<label>PWM Duty Cycle (0-255):</label><br>"
+        "<input type='number' name='pwm_duty' min='0' max='255' value='%u' style='width:100%%;padding:6px;margin-bottom:10px;'><br>"
+        "<button type='submit' style='background:#6c757d;color:#fff;font-size:1.1em;padding:8px 24px;border:none;border-radius:6px;cursor:pointer;width:100%%;'>Set Motor PWM</button>"
         "</form>"
         "<hr style='margin:18px 0; border:0; border-top:2px solid #eee;'>"
         "<form method='POST' action='/save'>"
@@ -394,6 +533,7 @@ void handleConfigPage(AsyncWebServerRequest *request) {
         "updatePos();"
         "</script>"
         "</div></body></html>",
+        pwm_freq, pwm_duty,
         (slave_number == 1 ? " selected" : ""),
         (slave_number == 2 ? " selected" : ""),
         (slave_number == 3 ? " selected" : ""),
@@ -406,13 +546,14 @@ void handleConfigPage(AsyncWebServerRequest *request) {
         (slave_number == 10 ? " selected" : ""),
         (slave_number == 11 ? " selected" : ""),
         (slave_number == 12 ? " selected" : "")
-
     );
     request->send(200, "text/html", html);
+    free(html);
 }
 
 void startConfigAPAndWebserver() {
     WiFi.mode(WIFI_AP);
+    WiFi.setTxPower(WIFI_POWER_8_5dBm); // Reduce WiFi transmit power for testing
     WiFi.softAP("SleepyLoRaSlave", "blind1234");
     server.on("/", HTTP_GET, handleConfigPage);
     server.on("/update", HTTP_POST, [](AsyncWebServerRequest *request){
@@ -508,6 +649,7 @@ void startConfigAPAndWebserver() {
     server.on("/set_closed", HTTP_POST, handleSetClosedLimit);
     server.on("/set_open", HTTP_POST, handleSetOpenLimit);
     server.on("/position", HTTP_GET, handleGetPosition);
+    server.on("/set_pwm", HTTP_POST, handleSetPWM);
     server.begin();
     configPortalActive = true;
     configPortalStartTime = millis();
@@ -588,17 +730,46 @@ bool isAddressInUse(uint8_t candidate_addr) {
 }
 
 void setup() {
+    // Robust NVS init and recovery
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        LOG_ERROR("[NVS] nvs_flash_init() failed (%d), erasing and re-initializing...\n", nvs_ret);
+        nvs_flash_erase();
+        nvs_ret = nvs_flash_init();
+        if (nvs_ret != ESP_OK) {
+            LOG_ERROR("[NVS] nvs_flash_init() failed after erase (%d), rebooting...\n", nvs_ret);
+            delay(100);
+            ESP.restart();
+        }
+    } else if (nvs_ret != ESP_OK) {
+        LOG_ERROR("[NVS] nvs_flash_init() failed (%d), rebooting...\n", nvs_ret);
+        delay(100);
+        ESP.restart();
+    }
     pinMode(IN_A_PIN, OUTPUT);
     pinMode(IN_B_PIN, OUTPUT);
     pinMode(EN_PIN, OUTPUT);
     digitalWrite(IN_A_PIN, LOW);
     digitalWrite(IN_B_PIN, LOW);
     digitalWrite(EN_PIN, LOW);
-    prefs.begin("slavecfg", true);
-    slave_number = prefs.getUChar("slave_number", 1);
-    prefs.end();
+    // Robustly open slavecfg namespace, create if missing
+    if (!prefs.begin("slavecfg", true)) {
+        LOG_WARN("[NVS] Preferences.begin('slavecfg', true) failed, trying RW mode to create namespace...\n");
+        if (!prefs.begin("slavecfg", false)) {
+            LOG_ERROR("[NVS] Preferences.begin('slavecfg', false) also failed, erasing NVS and rebooting!\n");
+            eraseNVSAndReboot();
+        }
+        // Namespace created, write default value
+        prefs.putUChar("slave_number", 1);
+        slave_number = 1;
+        prefs.end();
+    } else {
+        slave_number = prefs.getUChar("slave_number", 1);
+        prefs.end();
+    }
     rs485_addr = BASE_ADDR + (slave_number - 1);
     loadRawLimitsFromFlash();
+    loadPWMSettingsFromFlash();
     Serial.begin(115200);
     pinMode(RS485_DIR_PIN, OUTPUT);
     RS485_RECEIVE(); // Default to receive mode
@@ -616,6 +787,7 @@ void setup() {
     } else {
       blind_state = STATE_CLOSED;
     }
+    setupPWM();
 }
 
 void loop() {
@@ -710,4 +882,3 @@ void loop() {
         blind_position = readPosition();
     }
 }
-
