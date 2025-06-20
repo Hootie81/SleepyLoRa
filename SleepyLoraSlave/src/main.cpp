@@ -432,32 +432,62 @@ void loadPWMSettingsFromFlash() {
     prefs.end();
 }
 
-void setupPWM() {
-    ledcSetup(EN_PWM_CHANNEL, pwm_freq, EN_PWM_RESOLUTION);
-    ledcAttachPin(EN_PIN, EN_PWM_CHANNEL);
-    ledcWrite(EN_PWM_CHANNEL, pwm_duty);
+void saveTimingSettingsToFlash(time_t stroke, time_t disengage) {
+    LOG_INFO("[NVS] Saving timing settings to flash: stroke_time=%ld, disengage_time=%ld\n", stroke, disengage);
+    if (!prefs.begin("blindcfg", false)) {
+        LOG_ERROR("[NVS] Failed to open 'blindcfg' namespace for writing!\n");
+        eraseNVSAndReboot();
+    }
+    prefs.putULong("stroke_time", stroke);
+    prefs.putULong("disengage_time", disengage);
+    prefs.end();
 }
 
-void updatePWM(uint32_t freq, uint8_t duty) {
-    pwm_freq = freq;
-    pwm_duty = duty;
-    ledcSetup(EN_PWM_CHANNEL, pwm_freq, EN_PWM_RESOLUTION);
-    ledcWrite(EN_PWM_CHANNEL, pwm_duty);
-    savePWMSettingsToFlash(pwm_freq, pwm_duty);
+void loadTimingSettingsFromFlash() {
+    LOG_INFO("[NVS] Loading timing settings from flash...\n");
+    if (!prefs.begin("blindcfg", false)) {
+        LOG_ERROR("[NVS] Failed to open 'blindcfg' namespace for reading!\n");
+        eraseNVSAndReboot();
+    }
+    bool needSave = false;
+    if (!prefs.isKey("stroke_time")) {
+        LOG_WARN("[NVS] 'stroke_time' key missing, using default 14000.\n");
+        stroke_time = 14000;
+        needSave = true;
+    } else {
+        stroke_time = prefs.getULong("stroke_time", 14000);
+        LOG_INFO("[NVS] Loaded stroke_time: %ld\n", stroke_time);
+    }
+    if (!prefs.isKey("disengage_time")) {
+        LOG_WARN("[NVS] 'disengage_time' key missing, using default 1000.\n");
+        disengage_time = 1000;
+        needSave = true;
+    } else {
+        disengage_time = prefs.getULong("disengage_time", 1000);
+        LOG_INFO("[NVS] Loaded disengage_time: %ld\n", disengage_time);
+    }
+    if (needSave) {
+        LOG_INFO("[NVS] Saving default timing settings to flash.\n");
+        prefs.putULong("stroke_time", stroke_time);
+        prefs.putULong("disengage_time", disengage_time);
+    }
+    prefs.end();
 }
 
-void handleSetPWM(AsyncWebServerRequest *request) {
-    if (request->hasParam("pwm_freq", true) && request->hasParam("pwm_duty", true)) {
-        uint32_t freq = request->getParam("pwm_freq", true)->value().toInt();
-        uint8_t duty = request->getParam("pwm_duty", true)->value().toInt();
-        if (freq < 100 || freq > 20000 || duty > 255) {
-            request->send(400, "text/html", "<html><body>Invalid PWM values.<br><a href='/' >Back</a></body></html>");
+void handleSetTiming(AsyncWebServerRequest *request) {
+    if (request->hasParam("stroke_time", true) && request->hasParam("disengage_time", true)) {
+        time_t stroke = request->getParam("stroke_time", true)->value().toInt();
+        time_t disengage = request->getParam("disengage_time", true)->value().toInt();
+        if (stroke < 1000 || stroke > 60000 || disengage < 100 || disengage > 10000) {
+            request->send(400, "text/html", "<html><body>Invalid timing values.<br><a href='/' >Back</a></body></html>");
             return;
         }
-        updatePWM(freq, duty);
-        request->send(200, "text/html", "<html><body>PWM settings updated.<br><a href='/' >Back</a></body></html>");
+        stroke_time = stroke;
+        disengage_time = disengage;
+        saveTimingSettingsToFlash(stroke_time, disengage_time);
+        request->send(200, "text/html", "<html><body>Timing settings updated.<br><a href='/' >Back</a></body></html>");
     } else {
-        request->send(400, "text/html", "<html><body>Missing PWM parameters.<br><a href='/' >Back</a></body></html>");
+        request->send(400, "text/html", "<html><body>Missing timing parameters.<br><a href='/' >Back</a></body></html>");
     }
 }
 
@@ -487,6 +517,13 @@ void handleConfigPage(AsyncWebServerRequest *request) {
         "</form>"
         "<form method='POST' action='/set_open' style='margin-top:10px;'>"
         "<button type='submit' style='background:#17a2b8;color:#fff;font-size:1.1em;padding:8px 24px;border:none;border-radius:6px;cursor:pointer;width:100%%;'>Set Open Limit (Current Position)</button>"
+        "</form>"
+        "<form method='POST' action='/set_timing' style='margin-top:10px;'>"
+        "<label>Stroke Time (ms):</label><br>"
+        "<input type='number' name='stroke_time' min='1000' max='60000' value='%ld' style='width:100%%;padding:6px;margin-bottom:8px;'><br>"
+        "<label>Disengage Time (ms):</label><br>"
+        "<input type='number' name='disengage_time' min='100' max='10000' value='%ld' style='width:100%%;padding:6px;margin-bottom:10px;'><br>"
+        "<button type='submit' style='background:#007bff;color:#fff;font-size:1.1em;padding:8px 24px;border:none;border-radius:6px;cursor:pointer;width:100%%;'>Set Timing</button>"
         "</form>"
         "<form method='POST' action='/set_pwm' style='margin-top:10px;'>"
         "<label>PWM Frequency (Hz):</label><br>"
@@ -533,7 +570,7 @@ void handleConfigPage(AsyncWebServerRequest *request) {
         "updatePos();"
         "</script>"
         "</div></body></html>",
-        pwm_freq, pwm_duty,
+        stroke_time, disengage_time, pwm_freq, pwm_duty,
         (slave_number == 1 ? " selected" : ""),
         (slave_number == 2 ? " selected" : ""),
         (slave_number == 3 ? " selected" : ""),
@@ -549,6 +586,35 @@ void handleConfigPage(AsyncWebServerRequest *request) {
     );
     request->send(200, "text/html", html);
     free(html);
+}
+
+void setupPWM() {
+    ledcSetup(EN_PWM_CHANNEL, pwm_freq, EN_PWM_RESOLUTION);
+    ledcAttachPin(EN_PIN, EN_PWM_CHANNEL);
+    ledcWrite(EN_PWM_CHANNEL, pwm_duty);
+}
+
+void updatePWM(uint32_t freq, uint8_t duty) {
+    pwm_freq = freq;
+    pwm_duty = duty;
+    ledcSetup(EN_PWM_CHANNEL, pwm_freq, EN_PWM_RESOLUTION);
+    ledcWrite(EN_PWM_CHANNEL, pwm_duty);
+    savePWMSettingsToFlash(pwm_freq, pwm_duty);
+}
+
+void handleSetPWM(AsyncWebServerRequest *request) {
+    if (request->hasParam("pwm_freq", true) && request->hasParam("pwm_duty", true)) {
+        uint32_t freq = request->getParam("pwm_freq", true)->value().toInt();
+        uint8_t duty = request->getParam("pwm_duty", true)->value().toInt();
+        if (freq < 100 || freq > 20000 || duty > 255) {
+            request->send(400, "text/html", "<html><body>Invalid PWM values.<br><a href='/' >Back</a></body></html>");
+            return;
+        }
+        updatePWM(freq, duty);
+        request->send(200, "text/html", "<html><body>PWM settings updated.<br><a href='/' >Back</a></body></html>");
+    } else {
+        request->send(400, "text/html", "<html><body>Missing PWM parameters.<br><a href='/' >Back</a></body></html>");
+    }
 }
 
 void startConfigAPAndWebserver() {
@@ -650,6 +716,7 @@ void startConfigAPAndWebserver() {
     server.on("/set_open", HTTP_POST, handleSetOpenLimit);
     server.on("/position", HTTP_GET, handleGetPosition);
     server.on("/set_pwm", HTTP_POST, handleSetPWM);
+    server.on("/set_timing", HTTP_POST, handleSetTiming);
     server.begin();
     configPortalActive = true;
     configPortalStartTime = millis();
@@ -770,6 +837,7 @@ void setup() {
     rs485_addr = BASE_ADDR + (slave_number - 1);
     loadRawLimitsFromFlash();
     loadPWMSettingsFromFlash();
+    loadTimingSettingsFromFlash();
     Serial.begin(115200);
     pinMode(RS485_DIR_PIN, OUTPUT);
     RS485_RECEIVE(); // Default to receive mode
