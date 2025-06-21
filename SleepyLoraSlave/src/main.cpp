@@ -17,6 +17,7 @@
 #include <Update.h>
 #include <Ticker.h>
 #include <nvs_flash.h>
+#include <AsyncEventSource.h>
 
 // Debug macros with log levels
 #define DEBUG_SERIAL
@@ -81,6 +82,7 @@ volatile uint8_t last_command = 0;
 volatile uint8_t last_payload[8];
 volatile bool command_received = false;
 AsyncWebServer server(80);
+AsyncEventSource events("/events"); // SSE event source
 Ticker webserverTimeoutTicker;
 bool configPortalActive = false;
 unsigned long configPortalStartTime = 0;
@@ -249,17 +251,31 @@ uint16_t readPosition(void) {
   long posCalc = map(posAvg, closed_raw, open_raw, 0, 1000);  // based on 390k and 100k voltage divider
   uint16_t posConst = constrain(posCalc, 0, 1000);
   cached_scaled_position = posConst;
-  LOG_DEBUG("  Blind Position: %u\r\n", posConst);
+  //LOG_DEBUG("  Blind Position: %u\r\n", posConst);
   return posConst;
 }
 
 int readPositionRaw(void) {
-  int posAvg;
-
-  int posRaw = analogReadMilliVolts(POSITION_PIN);
-  posAvg = posEwma.filter(posRaw);
-  LOG_DEBUG("RAW Position: %u  ", posAvg);
-  return posAvg;
+    const int samples = 9;
+    int readings[samples];
+    for (int i = 0; i < samples; ++i) {
+        readings[i] = analogReadMilliVolts(POSITION_PIN);
+        delayMicroseconds(200); // Small delay for ADC settling
+    }
+    // Simple insertion sort for small arrays
+    for (int i = 1; i < samples; ++i) {
+        int key = readings[i];
+        int j = i - 1;
+        while (j >= 0 && readings[j] > key) {
+            readings[j + 1] = readings[j];
+            j--;
+        }
+        readings[j + 1] = key;
+    }
+    int median = readings[samples / 2];
+    int posAvg = posEwma.filter(median);
+    // LOG_DEBUG("RAW Position: %u  ", posAvg); // Commented out to prevent serial flooding
+    return posAvg;
 }
 
 // set a direction and a max/estimated runtime, motor stop may be called once position reached
@@ -311,6 +327,38 @@ void disengage_motor(void) {
   return;
 }
 
+bool calibrating = false;
+
+// Forward declaration for timing settings loader
+void loadTimingSettingsFromFlash();
+
+// Helper function to robustly detect engage time from samples
+int findEngageSample(const int *samples, int count, int baseline, int threshold, int sustain = 3) {
+    for (int i = 0; i < count - sustain; ++i) {
+        bool sustained = true;
+        for (int j = 0; j < sustain; ++j) {
+            if (abs(samples[i + j] - baseline) < threshold) {
+                sustained = false;
+                break;
+            }
+        }
+        if (sustained) return i;
+    }
+    return -1;
+}
+
+// Helper: Find first robust engage sample index
+int findEngageSample(int baseline, int *samples, int count, int threshold, int sustain) {
+    for (int i = 0; i < count - sustain + 1; ++i) {
+        int valid = 0;
+        for (int j = 0; j < sustain; ++j) {
+            if (abs(samples[i + j] - baseline) > threshold) valid++;
+        }
+        if (valid >= sustain - 1) return i;
+    }
+    return -1;
+}
+
 void update_motor(void) {
   if (motor_running) {
     uint16_t calcPos = readPosition();
@@ -330,6 +378,11 @@ void update_motor(void) {
     if (millis() - motor_start_time > motor_run_time) {
       if (motor_engaged) {
         LOG_WARN("Timeout before position achieved\r\n");
+        if (calibrating) {
+          LOG_ERROR("[CAL] Stroke timeout during calibration! Restoring previous timing values.\n");
+          loadTimingSettingsFromFlash();
+          calibrating = false;
+        }
         if (calcPos > 10) {
           blind_state = STATE_OPEN;
         } else {
@@ -381,11 +434,14 @@ uint8_t loadLastMoveStatusFromFlash() {
 }
 
 void handleGetPosition(AsyncWebServerRequest *request) {
+    // Always update position before responding
+    uint16_t latest_scaled = readPosition();
+    int latest_raw = cached_raw_position; // readPosition() updates this
     char json[64];
     snprintf(json, sizeof(json),
         "{\"raw\":%d,\"percent\":%.1f}",
-        cached_raw_position,
-        cached_scaled_position / 10.0f
+        latest_raw,
+        latest_scaled / 10.0f
     );
     request->send(200, "application/json", json);
 }
@@ -443,6 +499,9 @@ void saveTimingSettingsToFlash(time_t stroke, time_t disengage) {
     prefs.end();
 }
 
+void loadTimingSettingsFromFlash();
+void handleAutoCalibrate(AsyncWebServerRequest *request);
+
 void loadTimingSettingsFromFlash() {
     LOG_INFO("[NVS] Loading timing settings from flash...\n");
     if (!prefs.begin("blindcfg", false)) {
@@ -492,12 +551,12 @@ void handleSetTiming(AsyncWebServerRequest *request) {
 }
 
 void handleConfigPage(AsyncWebServerRequest *request) {
-    char *html = (char*)malloc(4096);
+    char *html = (char*)malloc(8192); // Increase buffer for safety
     if (!html) {
         request->send(500, "text/html", "Internal Error: Out of Memory");
         return;
     }
-    snprintf(html, 4096,
+    snprintf(html, 8192,
         "<html><body style='font-family:monospace; background:#f8f9fa; margin:0; padding:0;'>"
         "<div style='max-width:480px;margin:32px auto 0 auto;padding:24px 24px 16px 24px;background:#fff;border-radius:10px;box-shadow:0 2px 12px #0001;'>"
         "<pre style='font-family:monospace; font-size:16px; text-align:center; margin:0 0 12px 0;'>\r\n"
@@ -505,18 +564,22 @@ void handleConfigPage(AsyncWebServerRequest *request) {
         "/ ___|| | ___  ___ _ __  _   _| |    ___ |  _ \\ __ _ \r\n"
         "\\___ \\| |/ _ \\/ _ \\ '_ \\| | | | |   / _ \\| |_) / _` |\r\n"
         " ___) | |  __/  __/ |_) | |_| | |__| (_) |  _ < (_| |\r\n"
-        "|____/|_|\\___|\\___| .__/ \\__, |_____\\___/|_| \\_\\__,_|\r\n"
+        "|____/|_|\\___|\\___| .__/ \\,__|_____|\\___/|_| \\_\\__,_|\r\n"
         "                  |_|    |___/                       \r\n"
         "</pre>"
         "<h2 style='text-align:center;margin:0 0 18px 0;'>SleepyLora Slave Config</h2>"
         "<div id='livepos' style='text-align:center;font-size:1.1em;margin-bottom:16px;'>"
-        "Raw Position: <span id='rawpos'>...</span>  Blind Position: <span id='blindpos'>...</span>%%"
+        "Raw Position: <span id='rawpos'>...</span>  Blind Position: <span id='blindpos'>...</span>%"
         "</div>"
+        "<div id='poserror' style='color:#c00;text-align:center;margin-bottom:8px;'></div>"
         "<form method='POST' action='/set_closed' style='margin-top:10px;'>"
         "<button type='submit' style='background:#ffc107;color:#222;font-size:1.1em;padding:8px 24px;border:none;border-radius:6px;cursor:pointer;width:100%%;'>Set Closed Limit (Current Position)</button>"
         "</form>"
         "<form method='POST' action='/set_open' style='margin-top:10px;'>"
         "<button type='submit' style='background:#17a2b8;color:#fff;font-size:1.1em;padding:8px 24px;border:none;border-radius:6px;cursor:pointer;width:100%%;'>Set Open Limit (Current Position)</button>"
+        "</form>"
+        "<form method='POST' action='/autocal' style='margin-top:10px;'>"
+        "<button type='submit' style='background:#fd7e14;color:#fff;font-size:1.1em;padding:8px 24px;border:none;border-radius:6px;cursor:pointer;width:100%%;'>Auto Calibrate Stroke & Backlash</button>"
         "</form>"
         "<form method='POST' action='/set_timing' style='margin-top:10px;'>"
         "<label>Stroke Time (ms):</label><br>"
@@ -560,14 +623,28 @@ void handleConfigPage(AsyncWebServerRequest *request) {
         "<button type='submit' style='background:#dc3545;color:#fff;font-size:1.1em;padding:8px 24px;border:none;border-radius:6px;cursor:pointer;'>Close Web Portal & Sleep</button>"
         "</form>"
         "<script>"
-        "function updatePos() {"
-        "  fetch('/position').then(r=>r.json()).then(d=>{"
-        "    document.getElementById('rawpos').textContent = d.raw;"
-        "    document.getElementById('blindpos').textContent = d.percent.toFixed(1);"
-        "  });"
-        "}"
-        "setInterval(updatePos, 1000);"
-        "updatePos();"
+        "document.addEventListener('DOMContentLoaded', function() {"
+        "  var raw = document.getElementById('rawpos');"
+        "  var blind = document.getElementById('blindpos');"
+        "  var err = document.getElementById('poserror');"
+        "  if (!raw || !blind || !err) return;"
+        "  err.textContent = 'SCRIPT RUNNING';"
+        "  raw.textContent = 'LOADING...';"
+        "  blind.textContent = 'LOADING...';"
+        "  var es = new EventSource('/events');"
+        "  es.onopen = function() { err.textContent = 'Live updates connected.'; };"
+        "  es.onerror = function(e) { err.textContent = 'SSE connection error.'; };"
+        "  es.onmessage = function(ev) {"
+        "    try {"
+        "      var d = JSON.parse(ev.data);"
+        "      raw.textContent = d.raw;"
+        "      blind.textContent = d.percent.toFixed(1);"
+        "      err.textContent = '';"
+        "    } catch(e) {"
+        "      err.textContent = 'Parse error: ' + e;"
+        "    }"
+        "  };"
+        "});"
         "</script>"
         "</div></body></html>",
         stroke_time, disengage_time, pwm_freq, pwm_duty,
@@ -660,7 +737,7 @@ void startConfigAPAndWebserver() {
             "/ ___|| | ___  ___ _ __  _   _| |    ___ |  _ \\ __ _ \r\n"
             "\\___ \\| |/ _ \\/ _ \\ '_ \\| | | | |   / _ \\| |_) / _` |\r\n"
             " ___) | |  __/  __/ |_) | |_| | |__| (_) |  _ < (_| |\r\n"
-            "|____/|_|\\___|\\___| .__/ \\__, |_____\\___/|_| \\_\\__,_|\r\n"
+            "|____/|_|\\___|\\___| .__/ \\,__|_____|\\___/|_| \\_\\__,_|\r\n"
             "                  |_|    |___/                       \r\n"
             "</pre>"
             "<h2 style='text-align:center;margin:0 0 18px 0;'>SleepyLora Slave Firmware Update</h2>"
@@ -715,14 +792,15 @@ void startConfigAPAndWebserver() {
     server.on("/set_closed", HTTP_POST, handleSetClosedLimit);
     server.on("/set_open", HTTP_POST, handleSetOpenLimit);
     server.on("/position", HTTP_GET, handleGetPosition);
+    server.addHandler(&events); // Register SSE endpoint
     server.on("/set_pwm", HTTP_POST, handleSetPWM);
     server.on("/set_timing", HTTP_POST, handleSetTiming);
+    server.on("/autocal", HTTP_POST, handleAutoCalibrate);
     server.begin();
     configPortalActive = true;
     configPortalStartTime = millis();
     webserverTimeoutTicker.once_ms(300000, [](){
         stopConfigAPAndWebserver();
-
     });
 }
 
@@ -858,10 +936,106 @@ void setup() {
     setupPWM();
 }
 
+// ===================== Calibration Movement Detection Settings =====================
+// These control how movement is detected during calibration:
+// - MOVEMENT_THRESHOLD: Minimum change in position (raw units) from the start value to consider as movement.
+// - MOVEMENT_CONSECUTIVE_SAMPLES: Number of consecutive samples above threshold required to confirm movement.
+// The engage time is taken from the first sample that exceeds the threshold.
+#define MOVEMENT_THRESHOLD 10
+#define MOVEMENT_CONSECUTIVE_SAMPLES 3
+// ===================================================================================
+
+// Calibration state machine definitions
+
+enum CalibState {
+    CALIB_IDLE = 0,
+    CALIB_START,
+    CALIB_MOVE_TO_CLOSED,
+    CALIB_WAIT_CLOSED,
+    CALIB_FORWARD_STROKE_INIT,
+    CALIB_FORWARD_STROKE,
+    CALIB_FORWARD_DONE,
+    CALIB_REVERSE_STROKE_INIT,
+    CALIB_REVERSE_STROKE,
+    CALIB_REVERSE_DONE,
+    // New states for second cycle
+    CALIB_SECOND_FORWARD_STROKE_INIT,
+    CALIB_SECOND_FORWARD_STROKE,
+    CALIB_SECOND_FORWARD_DONE,
+    CALIB_SECOND_REVERSE_STROKE_INIT,
+    CALIB_SECOND_REVERSE_STROKE,
+    CALIB_SECOND_REVERSE_DONE,
+    CALIB_SAVE,
+    CALIB_COMPLETE,
+    CALIB_ERROR
+};
+
+struct Calibration {
+    CalibState state = CALIB_IDLE;
+    unsigned long start_time = 0;
+    unsigned long move_start_time = 0;
+    unsigned long move_end_time = 0;
+    unsigned long rev_move_start_time = 0;
+    unsigned long rev_move_end_time = 0;
+    unsigned long engage_time = 0;
+    unsigned long forward_stroke_time = 0;
+    unsigned long reverse_engage_time = 0;
+    unsigned long reverse_stroke_time = 0;
+    unsigned long disengage_time_calc = 0; // <-- add this line
+    time_t orig_stroke = 0;
+    time_t orig_disengage = 0;
+    int *pos_samples = nullptr;
+    unsigned long *time_samples = nullptr;
+    int *rev_pos_samples = nullptr;
+    unsigned long *rev_time_samples = nullptr;
+    int sample_count = 400;
+    int baseline_count = 20;
+    int baseline_sum = 0;
+    int baseline = 0;
+    int noise_floor = 0;
+    int move_threshold = 0;
+    int move_start_idx = -1;
+    int move_end_idx = -1;
+    int rev_baseline_sum = 0;
+    int rev_baseline = 0;
+    int rev_noise_floor = 0;
+    int rev_move_threshold = 0;
+    int rev_move_start_idx = -1;
+    int rev_move_end_idx = -1;
+    bool error = false;
+
+    // New fields for simplified calibration
+    unsigned long motor_start_time = 0;
+    unsigned long movement_detected_time = 0;
+    unsigned long target_reached_time = 0;
+    unsigned long last_sample_time = 0;
+    int samples_taken = 0;
+    unsigned long rev_motor_start_time = 0;
+    unsigned long rev_movement_detected_time = 0;
+    unsigned long rev_target_reached_time = 0;
+    unsigned long rev_last_sample_time = 0;
+    int rev_samples_taken = 0;
+        // Second cycle fields
+    unsigned long engage_time2 = 0;
+    unsigned long forward_stroke_time2 = 0;
+    unsigned long reverse_engage_time2 = 0;
+    unsigned long reverse_stroke_time2 = 0;
+    unsigned long disengage_time_calc2 = 0;
+    
+};
+
+Calibration calib;
+
+// Forward declarations for calibration state machine
+void processCalibrationStep();
+void startCalibration();
+
 void loop() {
     static uint8_t buf[1 + 1 + 1 + 8 + 2 + 1];
     static size_t idx = 0;
     static unsigned long last_position_time = 0;
+    static int last_sent_raw = -1;
+    static uint16_t last_sent_scaled = 0;
     unsigned long now = millis();
     update_motor();
     // UART receive
@@ -948,5 +1122,384 @@ void loop() {
     if (now - last_position_time > 500) {
         last_position_time = now;
         blind_position = readPosition();
+        // SSE: Only send if changed
+        if (cached_raw_position != last_sent_raw || cached_scaled_position != last_sent_scaled) {
+            char json[64];
+            snprintf(json, sizeof(json), "{\"raw\":%d,\"percent\":%.1f}", cached_raw_position, cached_scaled_position / 10.0f);
+            events.send(json, NULL, millis());
+            last_sent_raw = cached_raw_position;
+            last_sent_scaled = cached_scaled_position;
+            Serial.printf("[SSE] Raw: %d  Blind: %.1f%%\r\n", cached_raw_position, cached_scaled_position / 10.0f);
+        }
     }
+    processCalibrationStep();
+}
+
+void startCalibration() {
+    if (calib.state != CALIB_IDLE) return;
+    calib = Calibration(); // reset
+    calib.state = CALIB_START;
+}
+
+void processCalibrationStep() {
+    // Declare these outside the switch to avoid jump errors
+    static unsigned long avg_stroke = 0;
+    static unsigned long avg_disengage = 0;
+    // Use defines for engage detection
+    // const int engage_threshold = 18;
+    // const int engage_sustain = 3;
+    switch (calib.state) {
+        case CALIB_IDLE:
+            break;
+        case CALIB_START:
+            LOG_INFO("[CAL] Starting auto calibration routine...\n");
+            calib.orig_disengage = disengage_time;
+            calib.orig_stroke = stroke_time;
+            disengage_time = 1;
+            stroke_time = 60000;
+            calib.state = CALIB_MOVE_TO_CLOSED;
+            break;
+        case CALIB_MOVE_TO_CLOSED:
+            LOG_INFO("[CAL] Moving to 0%% (closed)\n");
+            targetPos = 0;
+            motor_engaged = true;
+            run_motor(0x01, stroke_time);
+            calib.start_time = millis();
+            calib.state = CALIB_WAIT_CLOSED;
+            break;
+        case CALIB_WAIT_CLOSED:
+            if (readPosition() <= 10 || millis() - calib.start_time > 50000) {
+                stop_motor();
+                delay(500);
+                calib.state = CALIB_FORWARD_STROKE_INIT;
+            }
+            break;
+        case CALIB_FORWARD_STROKE_INIT: {
+            LOG_INFO("[CAL] Starting forward stroke (0%% to 100%%)\n");
+            if (calib.pos_samples) free(calib.pos_samples);
+            if (calib.time_samples) free(calib.time_samples);
+            calib.pos_samples = (int*)malloc(50 * sizeof(int)); // 5s at 100ms intervals
+            calib.time_samples = (unsigned long*)malloc(50 * sizeof(unsigned long));
+            calib.sample_count = 50;
+            calib.state = CALIB_FORWARD_STROKE;
+            calib.motor_start_time = millis();
+            calib.movement_detected_time = 0;
+            calib.target_reached_time = 0;
+            calib.last_sample_time = millis();
+            calib.samples_taken = 0;
+            calib.baseline = readPositionRaw();
+            calib.move_threshold = MOVEMENT_THRESHOLD; // Use configurable threshold
+            targetPos = 1000;
+            motor_engaged = true;
+            run_motor(0x02, stroke_time);
+            break;
+        }
+        case CALIB_FORWARD_STROKE: {
+            unsigned long now = millis();
+            // Take samples every 100ms for first 5s
+            if (calib.samples_taken < 50 && now - calib.last_sample_time >= 100) {
+                calib.pos_samples[calib.samples_taken] = readPositionRaw();
+                calib.time_samples[calib.samples_taken] = now - calib.motor_start_time;
+                calib.last_sample_time = now;
+                calib.samples_taken++;
+            }
+            int pos = readPositionRaw();
+            if (!calib.movement_detected_time && abs(pos - calib.baseline) > calib.move_threshold) {
+                calib.movement_detected_time = now;
+                LOG_INFO("[CAL] Forward movement detected at %lu ms\n", now - calib.motor_start_time);
+            }
+            if (readPosition() > 990) {
+                calib.target_reached_time = now;
+                stop_motor();
+                delay(500);
+                calib.state = CALIB_FORWARD_DONE;
+            }
+            break;
+        }
+        case CALIB_FORWARD_DONE: {
+            LOG_INFO("[CAL] Forward stroke samples (up to 50):\n");
+            for (int i = 0; i < calib.samples_taken; ++i) {
+                LOG_DEBUG("[CAL] t=%lu pos=%d\n", calib.time_samples[i], calib.pos_samples[i]);
+                delay(5);
+            }
+            // Post-process engage time
+            {
+                int idx = findEngageSample(calib.baseline, calib.pos_samples, calib.samples_taken, MOVEMENT_THRESHOLD, MOVEMENT_CONSECUTIVE_SAMPLES);
+                if (idx >= 0) {
+                    calib.movement_detected_time = calib.motor_start_time + calib.time_samples[idx];
+                    LOG_INFO("[CAL] Forward engage detected at sample %d, t=%lu ms\n", idx, calib.time_samples[idx]);
+                } else {
+                    calib.movement_detected_time = calib.motor_start_time;
+                    LOG_WARN("[CAL] Forward engage not robustly detected, using motor start time.\n");
+                }
+            }
+            stop_motor();
+            motor_running = false;
+            motor_engaged = false;
+            delay(300);
+            LOG_DEBUG("[CAL] Preparing for reverse stroke: motor stopped, flags reset.\n");
+            calib.state = CALIB_REVERSE_STROKE_INIT;
+            break;
+        }
+        case CALIB_REVERSE_STROKE_INIT: {
+            LOG_INFO("[CAL] Starting reverse stroke (100%% to 0%%)\n");
+            stop_motor();
+            delay(200);
+            motor_engaged = false;
+            last_motor_dir = false;
+            if (calib.rev_pos_samples) free(calib.rev_pos_samples);
+            if (calib.rev_time_samples) free(calib.rev_time_samples);
+            calib.rev_pos_samples = (int*)malloc(50 * sizeof(int));
+            calib.rev_time_samples = (unsigned long*)malloc(50 * sizeof(unsigned long));
+            calib.rev_samples_taken = 0;
+            calib.rev_baseline = readPositionRaw();
+            calib.rev_move_threshold = MOVEMENT_THRESHOLD; // Use configurable threshold
+            calib.rev_motor_start_time = millis();
+            calib.rev_movement_detected_time = 0;
+            calib.rev_target_reached_time = 0;
+            calib.rev_last_sample_time = millis();
+            targetPos = 0;
+            motor_engaged = true;
+            run_motor(0x01, stroke_time);
+            calib.state = CALIB_REVERSE_STROKE;
+            break;
+        }
+        case CALIB_REVERSE_STROKE: {
+            unsigned long now = millis();
+            if (calib.rev_samples_taken < 50 && now - calib.rev_last_sample_time >= 100) {
+                calib.rev_pos_samples[calib.rev_samples_taken] = readPositionRaw();
+                calib.rev_time_samples[calib.rev_samples_taken] = now - calib.rev_motor_start_time;
+                calib.rev_last_sample_time = now;
+                calib.rev_samples_taken++;
+            }
+            int pos = readPositionRaw();
+            if (!calib.rev_movement_detected_time && abs(pos - calib.rev_baseline) > calib.rev_move_threshold) {
+                calib.rev_movement_detected_time = now;
+                LOG_INFO("[CAL] Reverse movement detected at %lu ms\n", now - calib.rev_motor_start_time);
+            }
+            if (readPosition() < 10) {
+                calib.rev_target_reached_time = now;
+                stop_motor();
+                delay(500);
+                calib.state = CALIB_REVERSE_DONE;
+            }
+            break;
+        }
+        case CALIB_REVERSE_DONE: {
+            LOG_INFO("[CAL] Reverse stroke samples (up to 50):\n");
+            for (int i = 0; i < calib.rev_samples_taken; ++i) {
+                LOG_DEBUG("[CAL] t=%lu pos=%d\n", calib.rev_time_samples[i], calib.rev_pos_samples[i]);
+                delay(5);
+            }
+            // Post-process reverse engage time
+            {
+                int idx = findEngageSample(calib.rev_baseline, calib.rev_pos_samples, calib.rev_samples_taken, MOVEMENT_THRESHOLD, MOVEMENT_CONSECUTIVE_SAMPLES);
+                if (idx >= 0) {
+                    calib.rev_movement_detected_time = calib.rev_motor_start_time + calib.rev_time_samples[idx];
+                    LOG_INFO("[CAL] Reverse engage detected at sample %d, t=%lu ms\n", idx, calib.rev_time_samples[idx]);
+                } else {
+                    calib.rev_movement_detected_time = calib.rev_motor_start_time;
+                    LOG_WARN("[CAL] Reverse engage not robustly detected, using motor start time.\n");
+                }
+            }
+            // Start second forward stroke
+            calib.state = CALIB_SECOND_FORWARD_STROKE_INIT;
+            break;
+        }
+        case CALIB_SECOND_FORWARD_STROKE_INIT: {
+            LOG_INFO("[CAL] Second forward stroke (0%% to 100%%)\n");
+            if (calib.pos_samples) free(calib.pos_samples);
+            if (calib.time_samples) free(calib.time_samples);
+            calib.pos_samples = (int*)malloc(50 * sizeof(int));
+            calib.time_samples = (unsigned long*)malloc(50 * sizeof(unsigned long));
+            calib.samples_taken = 0;
+            calib.motor_start_time = millis();
+            calib.movement_detected_time = 0;
+            calib.target_reached_time = 0;
+            calib.last_sample_time = millis();
+            calib.baseline = readPositionRaw();
+            calib.move_threshold = MOVEMENT_THRESHOLD; // Use configurable threshold
+            targetPos = 1000;
+            motor_engaged = true;
+            run_motor(0x02, stroke_time);
+            calib.state = CALIB_SECOND_FORWARD_STROKE;
+            break;
+        }
+        case CALIB_SECOND_FORWARD_STROKE: {
+            unsigned long now = millis();
+            if (calib.samples_taken < 50 && now - calib.last_sample_time >= 100) {
+                calib.pos_samples[calib.samples_taken] = readPositionRaw();
+                calib.time_samples[calib.samples_taken] = now - calib.motor_start_time;
+                calib.last_sample_time = now;
+                calib.samples_taken++;
+            }
+            int pos = readPositionRaw();
+            if (!calib.movement_detected_time && abs(pos - calib.baseline) > calib.move_threshold) {
+                calib.movement_detected_time = now;
+                LOG_INFO("[CAL] 2nd Forward movement detected at %lu ms\n", now - calib.motor_start_time);
+            }
+            if (readPosition() > 990) {
+                calib.target_reached_time = now;
+                stop_motor();
+                delay(500);
+                calib.state = CALIB_SECOND_FORWARD_DONE;
+            }
+            break;
+        }
+        case CALIB_SECOND_FORWARD_DONE: {
+            LOG_INFO("[CAL] 2nd Forward stroke samples (up to 50):\n");
+            for (int i = 0; i < calib.samples_taken; ++i) {
+                LOG_DEBUG("[CAL] t=%lu pos=%d\n", calib.time_samples[i], calib.pos_samples[i]);
+                delay(5);
+            }
+            // Post-process engage time for 2nd forward
+            {
+                int idx = findEngageSample(calib.baseline, calib.pos_samples, calib.samples_taken, MOVEMENT_THRESHOLD, MOVEMENT_CONSECUTIVE_SAMPLES);
+                if (idx >= 0) {
+                    calib.movement_detected_time = calib.motor_start_time + calib.time_samples[idx];
+                    LOG_INFO("[CAL] 2nd Forward engage detected at sample %d, t=%lu ms\n", idx, calib.time_samples[idx]);
+                } else {
+                    calib.movement_detected_time = calib.motor_start_time;
+                    LOG_WARN("[CAL] 2nd Forward engage not robustly detected, using motor start time.\n");
+                }
+            }
+            stop_motor();
+            motor_running = false;
+            motor_engaged = false;
+            delay(300);
+            LOG_DEBUG("[CAL] Preparing for 2nd reverse stroke: motor stopped, flags reset.\n");
+            calib.state = CALIB_SECOND_REVERSE_STROKE_INIT;
+            break;
+        }
+        case CALIB_SECOND_REVERSE_STROKE_INIT: {
+            LOG_INFO("[CAL] Second reverse stroke (100%% to 0%%)\n");
+            stop_motor();
+            delay(200);
+            motor_engaged = false;
+            last_motor_dir = false;
+            if (calib.rev_pos_samples) free(calib.rev_pos_samples);
+            if (calib.rev_time_samples) free(calib.rev_time_samples);
+            calib.rev_pos_samples = (int*)malloc(50 * sizeof(int));
+            calib.rev_time_samples = (unsigned long*)malloc(50 * sizeof(unsigned long));
+            calib.rev_samples_taken = 0;
+            calib.rev_motor_start_time = millis();
+            calib.rev_movement_detected_time = 0;
+            calib.rev_target_reached_time = 0;
+            calib.rev_last_sample_time = millis();
+            calib.rev_baseline = readPositionRaw();
+            calib.rev_move_threshold = MOVEMENT_THRESHOLD; // Use configurable threshold
+            targetPos = 0;
+            motor_engaged = true;
+            run_motor(0x01, stroke_time);
+            calib.state = CALIB_SECOND_REVERSE_STROKE;
+            break;
+        }
+        case CALIB_SECOND_REVERSE_STROKE: {
+            unsigned long now = millis();
+            if (calib.rev_samples_taken < 50 && now - calib.rev_last_sample_time >= 100) {
+                calib.rev_pos_samples[calib.rev_samples_taken] = readPositionRaw();
+                calib.rev_time_samples[calib.rev_samples_taken] = now - calib.rev_motor_start_time;
+                calib.rev_last_sample_time = now;
+                calib.rev_samples_taken++;
+            }
+            int pos = readPositionRaw();
+            if (!calib.rev_movement_detected_time && abs(pos - calib.rev_baseline) > calib.rev_move_threshold) {
+                calib.rev_movement_detected_time = now;
+                LOG_INFO("[CAL] 2nd Reverse movement detected at %lu ms\n", now - calib.rev_motor_start_time);
+            }
+            if (readPosition() < 10) {
+                calib.rev_target_reached_time = now;
+                stop_motor();
+                delay(500);
+                calib.state = CALIB_SECOND_REVERSE_DONE;
+            }
+            break;
+        }
+        case CALIB_SECOND_REVERSE_DONE: {
+            LOG_INFO("[CAL] 2nd Reverse stroke samples (up to 50):\n");
+            for (int i = 0; i < calib.rev_samples_taken; ++i) {
+                LOG_DEBUG("[CAL] t=%lu pos=%d\n", calib.rev_time_samples[i], calib.rev_pos_samples[i]);
+                delay(5);
+            }
+            // Post-process engage time for 2nd reverse
+            {
+                int idx = findEngageSample(calib.rev_baseline, calib.rev_pos_samples, calib.rev_samples_taken, MOVEMENT_THRESHOLD, MOVEMENT_CONSECUTIVE_SAMPLES);
+                if (idx >= 0) {
+                    calib.rev_movement_detected_time = calib.rev_motor_start_time + calib.rev_time_samples[idx];
+                    LOG_INFO("[CAL] 2nd Reverse engage detected at sample %d, t=%lu ms\n", idx, calib.rev_time_samples[idx]);
+                } else {
+                    calib.rev_movement_detected_time = calib.rev_motor_start_time;
+                    LOG_WARN("[CAL] 2nd Reverse engage not robustly detected, using motor start time.\n");
+                }
+            }
+            calib.state = CALIB_SAVE;
+            break;
+        }
+        case CALIB_SAVE: {
+            // First cycle
+            calib.engage_time = calib.movement_detected_time - calib.motor_start_time;
+            calib.forward_stroke_time = calib.target_reached_time - calib.movement_detected_time;
+            calib.reverse_engage_time = calib.rev_movement_detected_time - calib.rev_motor_start_time;
+            calib.reverse_stroke_time = calib.rev_target_reached_time - calib.rev_movement_detected_time;
+            calib.disengage_time_calc = calib.engage_time / 2;
+            // Second cycle
+            calib.engage_time2 = calib.movement_detected_time - calib.motor_start_time;
+            calib.forward_stroke_time2 = calib.target_reached_time - calib.movement_detected_time;
+            calib.reverse_engage_time2 = calib.rev_movement_detected_time - calib.rev_motor_start_time;
+            calib.reverse_stroke_time2 = calib.rev_target_reached_time - calib.rev_movement_detected_time;
+            calib.disengage_time_calc2 = calib.engage_time2 / 2;
+            // Average
+            avg_stroke = (calib.forward_stroke_time + calib.forward_stroke_time2) / 2;
+            avg_disengage = (calib.disengage_time_calc + calib.disengage_time_calc2) / 2;
+            LOG_INFO("[CAL] 1st Engage: %lu ms, 1st Stroke: %lu ms\n", calib.engage_time, calib.forward_stroke_time);
+            LOG_INFO("[CAL] 2nd Engage: %lu ms, 2nd Stroke: %lu ms\n", calib.engage_time2, calib.forward_stroke_time2);
+            LOG_INFO("[CAL] Averaged stroke_time: %lu ms, disengage_time: %lu ms\n", avg_stroke, avg_disengage);
+            disengage_time = avg_disengage;
+            stroke_time = avg_stroke;
+            saveTimingSettingsToFlash(stroke_time, disengage_time);
+            LOG_INFO("[CAL] Calibration complete. New stroke_time=%lu ms, disengage_time=%lu ms\n", stroke_time, disengage_time);
+            // Disengage actuator with new disengage_time
+            disengage_motor();
+            calib.state = CALIB_COMPLETE;
+            break;
+        }
+        case CALIB_COMPLETE: {
+            if (calib.pos_samples) free(calib.pos_samples);
+            if (calib.time_samples) free(calib.time_samples);
+            if (calib.rev_pos_samples) free(calib.rev_pos_samples);
+            if (calib.rev_time_samples) free(calib.rev_time_samples);
+            LOG_INFO("[CAL] Calibration finished.\n");
+            // Set blind_state based on final position
+            {
+                uint16_t final_pos = readPosition();
+                if (final_pos > 100) {
+                    blind_state = STATE_OPEN;
+                    LOG_INFO("[CAL] Final position: OPEN (%.1f%%)\n", final_pos / 10.0f);
+                } else {
+                    blind_state = STATE_CLOSED;
+                    LOG_INFO("[CAL] Final position: CLOSED (%.1f%%)\n", final_pos / 10.0f);
+                } 
+            }
+            calib.state = CALIB_IDLE;
+            break;
+        }
+        case CALIB_ERROR: {
+            if (calib.pos_samples) free(calib.pos_samples);
+            if (calib.time_samples) free(calib.time_samples);
+            if (calib.rev_pos_samples) free(calib.rev_pos_samples);
+            if (calib.rev_time_samples) free(calib.rev_time_samples);
+            LOG_ERROR("[CAL] Calibration failed due to error.\n");
+            calib.state = CALIB_IDLE;
+            break;
+        }
+    }
+}
+
+void handleAutoCalibrate(AsyncWebServerRequest *request) {
+    if (calib.state != CALIB_IDLE) {
+        request->send(200, "text/html", "<html><body>Calibration is already running.<br><a href='/' >Back</a></body></html>");
+        return;
+       }
+    startCalibration();
+    request->send(200, "text/html", "<html><body>Auto calibration started. This may take up to a minute.<br><a href='/' >Back</a></body></html>");
 }
