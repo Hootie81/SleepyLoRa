@@ -18,6 +18,7 @@
 #include <Ticker.h>
 #include <nvs_flash.h>
 #include <AsyncEventSource.h>
+#include <algorithm> // For std::min and std::max
 
 // Debug macros with log levels
 #define DEBUG_SERIAL
@@ -100,6 +101,8 @@ uint16_t cached_scaled_position = 0;
 
 time_t disengage_time = 1000;
 time_t stroke_time = 14000; // time for full stroke
+time_t dynamic_pwm_target_stroke_time = 8000; // default 8s, adjust as needed
+
 time_t motor_start_time;
 time_t motor_run_time;
 bool motor_running;
@@ -115,6 +118,54 @@ Preferences prefs;
 uint32_t pwm_freq = 1000; // Default 1kHz
 uint8_t pwm_duty = 255;   // Default 100% (255/255)
 
+// ===================== DYNAMIC PWM MODE =====================
+bool dynamic_pwm_mode = false; // Experimental: runtime toggle
+// Dynamic PWM control variables
+uint8_t dynamic_pwm_target = 140; // starting PWM for move
+uint8_t dynamic_pwm_engage = 100; // lower power for engage
+uint32_t dynamic_pwm_update_interval = 100; // ms
+unsigned long dynamic_pwm_last_update = 0;
+bool dynamic_pwm_in_engage = false;
+unsigned long dynamic_pwm_engage_start = 0;
+
+// Target speed and stall detection
+float dynamic_pwm_target_speed = 0.0f; // units: position delta per second
+float dynamic_pwm_speed_ewma = 0.0f;
+float dynamic_pwm_speed_alpha = 0.3f;
+uint16_t dynamic_pwm_last_pos = 0;
+unsigned long dynamic_pwm_last_pos_time = 0;
+uint8_t dynamic_pwm_current = 100;
+uint8_t dynamic_pwm_min = 80;
+uint8_t dynamic_pwm_max = 255;
+uint8_t dynamic_pwm_stall_count = 0;
+
+// Editable advanced parameters (remove const/define)
+uint8_t STALL_PWM_STEP = 20;  // Step to reduce PWM on stall detection
+uint8_t SPEED_CORRECTION_STEP = 10; // Step to adjust target speed 
+uint8_t STALL_COUNT_THRESHOLD_DEFAULT = 3; // Default stall count threshold
+uint8_t STALL_COUNT_THRESHOLD_AFTER_UNJAM1 = 5; // After first unjam attempt
+uint8_t STALL_COUNT_THRESHOLD_AFTER_UNJAM2 = 7; // After second unjam attempt
+unsigned long UNJAM_DURATION = 500; // ms to reverse motor (first attempt)
+unsigned long UNJAM_DURATION_2 = 1000; // ms to reverse motor (second attempt)
+
+// Jam detection and unjam routine variables
+uint8_t jam_attempt_count = 0;
+const uint8_t JAM_ATTEMPT_LIMIT = 2; // Max unjam attempts
+const uint8_t JAM_STALL_CYCLES = 2;  // Number of full stall cycles before jam
+uint8_t jam_stall_cycle_count = 0;
+bool in_unjam_routine = false;
+unsigned long unjam_start_time = 0;
+uint8_t unjam_direction = 0;
+uint8_t stall_count_threshold = 3; // Active stall count threshold, initialized to default
+
+// Struct to store original move parameters for unjam recovery
+struct MoveParams {
+    uint8_t direction;
+    uint16_t target_position;
+    unsigned long runtime;
+};
+MoveParams original_move = {0, 0, 0};
+
 void run_motor(uint8_t dir, int runtime);
 void disengage_motor(void);
 uint16_t readPosition(void);
@@ -126,6 +177,112 @@ uint8_t loadLastMoveStatusFromFlash();
 void stopConfigAPAndWebserver();
 void startConfigAPAndWebserver();
 bool isAddressInUse(uint8_t candidate_addr);
+
+// ===================== Calibration Movement Detection Settings =====================
+// These control how movement is detected during calibration:
+// - MOVEMENT_THRESHOLD: Minimum change in position (raw units) from the start value to consider as movement.
+// - MOVEMENT_CONSECUTIVE_SAMPLES: Number of consecutive samples above threshold required to confirm movement.
+// The engage time is taken from the first sample that exceeds the threshold.
+#define MOVEMENT_THRESHOLD 10
+#define MOVEMENT_CONSECUTIVE_SAMPLES 3
+// ===================================================================================
+
+// Calibration state machine definitions
+
+enum CalibState {
+    CALIB_IDLE = 0,
+    CALIB_START,
+    CALIB_MOVE_TO_CLOSED,
+    CALIB_WAIT_CLOSED,
+    CALIB_FORWARD_STROKE_INIT,
+    CALIB_FORWARD_STROKE,
+    CALIB_FORWARD_DONE,
+    CALIB_REVERSE_STROKE_INIT,
+    CALIB_REVERSE_STROKE,
+    CALIB_REVERSE_DONE,
+    // New states for second cycle
+    CALIB_SECOND_FORWARD_STROKE_INIT,
+    CALIB_SECOND_FORWARD_STROKE,
+    CALIB_SECOND_FORWARD_DONE,
+    CALIB_SECOND_REVERSE_STROKE_INIT,
+    CALIB_SECOND_REVERSE_STROKE,
+    CALIB_SECOND_REVERSE_DONE,
+    CALIB_SAVE,
+    CALIB_COMPLETE,
+    CALIB_ERROR
+};
+
+struct Calibration {
+    CalibState state = CALIB_IDLE;
+    unsigned long start_time = 0;
+    unsigned long move_start_time = 0;
+    unsigned long move_end_time = 0;
+    unsigned long rev_move_start_time = 0;
+    unsigned long rev_move_end_time = 0;
+    unsigned long engage_time = 0;
+    unsigned long forward_stroke_time = 0;
+    unsigned long reverse_engage_time = 0;
+    unsigned long reverse_stroke_time = 0;
+    unsigned long disengage_time_calc =  0; // <-- add this line
+    time_t orig_stroke = 0;
+    time_t orig_disengage = 0;
+    int *pos_samples = nullptr;
+    unsigned long *time_samples = nullptr;
+    int *rev_pos_samples = nullptr;
+    unsigned long *rev_time_samples = nullptr;
+    int sample_count = 400;
+    int baseline_count = 20;
+    int baseline_sum = 0;
+    int baseline = 0;
+    int noise_floor = 0;
+    int move_threshold = 0;
+    int move_start_idx = -1;
+    int move_end_idx = -1;
+    int rev_baseline_sum = 0;
+    int rev_baseline = 0;
+    int rev_noise_floor = 0;
+    int rev_move_threshold = 0;
+    int rev_move_start_idx = -1;
+    int rev_move_end_idx = -1;
+    bool error = false;
+
+    // New fields for simplified calibration
+    unsigned long motor_start_time = 0;
+    unsigned long movement_detected_time = 0;
+    unsigned long target_reached_time = 0;
+    unsigned long last_sample_time = 0;
+    int samples_taken = 0;
+    unsigned long rev_motor_start_time = 0;
+    unsigned long rev_movement_detected_time = 0;
+    unsigned long rev_target_reached_time = 0;
+    unsigned long rev_last_sample_time = 0;
+    int rev_samples_taken = 0;
+
+    unsigned long motor_start_time_1 = 0;
+    unsigned long movement_detected_time_1 = 0;
+    unsigned long target_reached_time_1 = 0;
+    unsigned long rev_motor_start_time_1 = 0;
+    unsigned long rev_movement_detected_time_1 = 0;
+    unsigned long rev_target_reached_time_1 = 0;
+        // Second cycle fields
+    unsigned long engage_time2 = 0;
+    unsigned long forward_stroke_time2 = 0;
+    unsigned long reverse_engage_time2 = 0;
+    unsigned long reverse_stroke_time2 = 0;
+    unsigned long disengage_time_calc2 = 0;
+    // Add average PWM fields for each stroke
+    uint8_t forward_pwm_avg;
+    uint8_t reverse_pwm_avg;
+    uint8_t forward_pwm_avg2;
+    uint8_t reverse_pwm_avg2;
+    
+};
+
+Calibration calib;
+
+// Forward declarations for calibration state machine
+void processCalibrationStep();
+void startCalibration();
 
 // CRC-16-CCITT
 uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
@@ -245,6 +402,33 @@ void handleSetOpenLimit(AsyncWebServerRequest *request) {
         "<html><body>Open limit set to current position (" + String(raw) + ").<br><a href='/'>Back</a></body></html>");
 }
 
+void saveDynamicPWMToFlash(bool mode) {
+    LOG_INFO("[NVS] Saving dynamic_pwm_mode to flash: %d\n", mode);
+    if (!prefs.begin("blindcfg", false)) {
+        LOG_ERROR("[NVS] Failed to open 'blindcfg' namespace for writing!\n");
+        eraseNVSAndReboot();
+    }
+    prefs.putUChar("dyn_pwm", mode ? 1 : 0);
+    prefs.end();
+}
+
+void loadDynamicPWMFromFlash() {
+    LOG_INFO("[NVS] Loading dynamic_pwm_mode from flash...\n");
+    if (!prefs.begin("blindcfg", false)) {
+        LOG_ERROR("[NVS] Failed to open 'blindcfg' namespace for reading!\n");
+        eraseNVSAndReboot();
+    }
+    if (!prefs.isKey("dyn_pwm")) {
+        LOG_WARN("[NVS] 'dyn_pwm' key missing, using default 0.\n");
+        dynamic_pwm_mode = false;
+        prefs.putUChar("dyn_pwm", 0);
+    } else {
+        dynamic_pwm_mode = prefs.getUChar("dyn_pwm", 0) ? true : false;
+        LOG_INFO("[NVS] Loaded dynamic_pwm_mode: %d\n", dynamic_pwm_mode);
+    }
+    prefs.end();
+}
+
 uint16_t readPosition(void) {
   int posAvg = readPositionRaw();
   cached_raw_position = posAvg;
@@ -310,8 +494,29 @@ void run_motor(uint8_t dir, int runtime) {
     }
     last_motor_dir = false;
   }
-  // Use PWM for EN_PIN
-  ledcWrite(EN_PWM_CHANNEL, pwm_duty);
+
+  if (dynamic_pwm_mode) {
+    ledcWrite(EN_PWM_CHANNEL, dynamic_pwm_engage);
+    LOG_INFO("[DYN_PWM] Engage phase: PWM set to %u\n", dynamic_pwm_engage);
+    dynamic_pwm_in_engage = true;
+    dynamic_pwm_engage_start = millis();
+    dynamic_pwm_last_update = millis();
+    dynamic_pwm_last_pos = calcPos;
+    dynamic_pwm_last_pos_time = millis();
+    dynamic_pwm_speed_ewma = 0.0f;
+    dynamic_pwm_current = dynamic_pwm_target;
+    dynamic_pwm_stall_count = 0;
+    // Set target speed based on calibration (full stroke time)
+    if (stroke_time > 0) {
+      dynamic_pwm_target_speed = 1000.0f / (float)dynamic_pwm_target_stroke_time * 1000.0f; // units: pos/second
+      LOG_INFO("[DYN_PWM] Target speed set to %.2f pos/sec (stroke_time=%ld ms)\n", dynamic_pwm_target_speed, dynamic_pwm_target_stroke_time);
+    } else {
+      dynamic_pwm_target_speed = 60.0f; // fallback
+    }
+  } else {
+    ledcWrite(EN_PWM_CHANNEL, pwm_duty);
+    dynamic_pwm_in_engage = false;
+  }
   motor_running = true;
   motor_start_time = millis();
   motor_run_time = runtime;
@@ -326,8 +531,6 @@ void disengage_motor(void) {
   run_motor(last_motor_dir ? 0x01 : 0x02, disengage_time);
   return;
 }
-
-bool calibrating = false;
 
 // Forward declaration for timing settings loader
 void loadTimingSettingsFromFlash();
@@ -359,8 +562,125 @@ int findEngageSample(int baseline, int *samples, int count, int threshold, int s
     return -1;
 }
 
+// Returns true if the last N samples in the buffer exceed the threshold from baseline
+bool isConsecutiveMovementDetected(const int* samples, int samples_taken, int baseline, int threshold, int consecutive) {
+    if (samples_taken < consecutive) return false;
+    for (int i = samples_taken - consecutive; i < samples_taken; ++i) {
+        if (abs(samples[i] - baseline) < threshold) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void update_motor(void) {
   if (motor_running) {
+    if (in_unjam_routine) {
+      unsigned long unjam_duration = (jam_attempt_count == 1) ? UNJAM_DURATION_2 : UNJAM_DURATION;
+      if (millis() - unjam_start_time > unjam_duration) {
+        stop_motor();
+        delay(100);
+        if (jam_attempt_count < JAM_ATTEMPT_LIMIT) {
+          // After first unjam, increase stall threshold
+          stall_count_threshold = (jam_attempt_count == 0) ? STALL_COUNT_THRESHOLD_AFTER_UNJAM1 : STALL_COUNT_THRESHOLD_AFTER_UNJAM2;
+          LOG_ERROR("[JAM] Retrying original direction after unjam attempt %u, stall threshold now %d\n", jam_attempt_count+1, stall_count_threshold);
+          jam_attempt_count++;
+          in_unjam_routine = false;
+          run_motor(original_move.direction, original_move.runtime);
+        } else {
+            LOG_ERROR("[JAM] Jam persists after %u unjam attempts. Aborting.\n", JAM_ATTEMPT_LIMIT);
+            disengage_motor();
+            // Set state based on current position
+            uint16_t pos = readPosition();
+            if (pos > 10) {
+                blind_state = STATE_OPEN;
+            } else {
+                blind_state = STATE_CLOSED;
+            }
+            last_move_status = 0x04; // Custom code for JAM_ABORTED
+            saveLastMoveStatusToFlash(last_move_status);
+            jam_attempt_count = 0;
+            jam_stall_cycle_count = 0;
+            in_unjam_routine = false;
+            stall_count_threshold = STALL_COUNT_THRESHOLD_DEFAULT; // Reset after abort
+            if (calib.state != CALIB_IDLE && calib.state != CALIB_COMPLETE && calib.state != CALIB_ERROR) {
+                LOG_ERROR("[CAL] Calibration aborted due to jam. Setting CALIB_ERROR state.\n");
+                calib.state = CALIB_ERROR;
+            }
+        }
+      }
+      return;
+    }
+    if (dynamic_pwm_mode) {
+      unsigned long now = millis();
+      uint16_t pos = readPosition();
+      // Handle engage phase
+      if (dynamic_pwm_in_engage) {
+        if ((calib.state != CALIB_IDLE && (now - dynamic_pwm_engage_start >= 4000)) ||
+            (calib.state == CALIB_IDLE && (now - dynamic_pwm_engage_start >= disengage_time))) {
+          ledcWrite(EN_PWM_CHANNEL, dynamic_pwm_current);
+          LOG_INFO("[DYN_PWM] Running phase: PWM set to %u\n", dynamic_pwm_current);
+          dynamic_pwm_in_engage = false;
+          dynamic_pwm_last_pos = pos;
+          dynamic_pwm_last_pos_time = now;
+        }
+      } else if (now - dynamic_pwm_last_update >= dynamic_pwm_update_interval) {
+        // Speed calculation
+        float dt = (now - dynamic_pwm_last_pos_time) / 1000.0f;
+        float dpos = abs((int)pos - (int)dynamic_pwm_last_pos);
+        float speed = (dt > 0.01f) ? dpos / dt : 0.0f;
+        dynamic_pwm_speed_ewma = dynamic_pwm_speed_alpha * speed + (1.0f - dynamic_pwm_speed_alpha) * dynamic_pwm_speed_ewma;
+        LOG_DEBUG("[DYN_PWM] Speed: %.2f pos/sec, Target: %.2f\n", dynamic_pwm_speed_ewma, dynamic_pwm_target_speed);
+        // Stall detection
+        if (dynamic_pwm_speed_ewma < dynamic_pwm_target_speed * 0.3f) {
+          dynamic_pwm_stall_count++;
+          LOG_WARN("[DYN_PWM] Possible stall detected (%u/%d)\n", dynamic_pwm_stall_count, stall_count_threshold);
+          if (dynamic_pwm_stall_count >= stall_count_threshold && dynamic_pwm_current < dynamic_pwm_max) {
+            dynamic_pwm_current = (uint8_t)std::min((int)dynamic_pwm_current + STALL_PWM_STEP, (int)dynamic_pwm_max);
+            ledcWrite(EN_PWM_CHANNEL, dynamic_pwm_current);
+            LOG_INFO("[DYN_PWM] Stall: PWM increased to %u\n", dynamic_pwm_current);
+            jam_stall_cycle_count++;
+            dynamic_pwm_stall_count = 0;
+            if (jam_stall_cycle_count >= JAM_STALL_CYCLES) {
+              // Jam detected, start unjam routine
+              LOG_ERROR("[JAM] Jam detected! Initiating unjam routine.\n");
+              // Save original move parameters for recovery
+              original_move.direction = last_motor_dir ? 0x01 : 0x02;
+              original_move.target_position = targetPos;
+              original_move.runtime = motor_run_time - (millis() - motor_start_time);
+              stop_motor();
+              delay(100);
+              // Reverse direction at full power
+              in_unjam_routine = true;
+              unjam_start_time = millis();
+              unjam_direction = (original_move.direction == 0x01) ? 0x02 : 0x01; // reverse direction
+              ledcWrite(EN_PWM_CHANNEL, dynamic_pwm_max);
+              digitalWrite(IN_A_PIN, unjam_direction == 0x01);
+              digitalWrite(IN_B_PIN, unjam_direction == 0x02);
+              motor_running = true;
+              return;
+            }
+          }
+        } else {
+          dynamic_pwm_stall_count = 0;
+          jam_stall_cycle_count = 0;
+          stall_count_threshold = STALL_COUNT_THRESHOLD_DEFAULT; // Reset after successful movement
+          // Adjust PWM to maintain target speed
+          if (dynamic_pwm_speed_ewma < dynamic_pwm_target_speed * 0.95f && dynamic_pwm_current < dynamic_pwm_max) {
+            dynamic_pwm_current = (uint8_t)std::min((int)dynamic_pwm_current + SPEED_CORRECTION_STEP, (int)dynamic_pwm_max);
+            ledcWrite(EN_PWM_CHANNEL, dynamic_pwm_current);
+            LOG_INFO("[DYN_PWM] PWM increased to %u\n", dynamic_pwm_current);
+          } else if (dynamic_pwm_speed_ewma > dynamic_pwm_target_speed * 1.05f && dynamic_pwm_current > dynamic_pwm_min) {
+            dynamic_pwm_current = (uint8_t)std::max((int)dynamic_pwm_current - SPEED_CORRECTION_STEP, (int)dynamic_pwm_min);
+            ledcWrite(EN_PWM_CHANNEL, dynamic_pwm_current);
+            LOG_INFO("[DYN_PWM] PWM decreased to %u\n", dynamic_pwm_current);
+          }
+        }
+        dynamic_pwm_last_update = now;
+        dynamic_pwm_last_pos = pos;
+        dynamic_pwm_last_pos_time = now;
+      }
+    }
     uint16_t calcPos = readPosition();
     if (motor_engaged && (abs(targetPos - calcPos) < 1 || (!last_motor_dir && calcPos > targetPos) || (last_motor_dir && calcPos < targetPos))) {
       LOG_DEBUG("Position achieved\r\n");
@@ -378,10 +698,8 @@ void update_motor(void) {
     if (millis() - motor_start_time > motor_run_time) {
       if (motor_engaged) {
         LOG_WARN("Timeout before position achieved\r\n");
-        if (calibrating) {
-          LOG_ERROR("[CAL] Stroke timeout during calibration! Restoring previous timing values.\n");
-          loadTimingSettingsFromFlash();
-          calibrating = false;
+        if (calib.state != CALIB_IDLE) {
+          calib.state = CALIB_ERROR;
         }
         if (calcPos > 10) {
           blind_state = STATE_OPEN;
@@ -551,12 +869,30 @@ void handleSetTiming(AsyncWebServerRequest *request) {
 }
 
 void handleConfigPage(AsyncWebServerRequest *request) {
-    char *html = (char*)malloc(8192); // Increase buffer for safety
+    char *html = (char*)malloc(16384); // Increased buffer for large HTML
     if (!html) {
         request->send(500, "text/html", "Internal Error: Out of Memory");
         return;
     }
-    snprintf(html, 8192,
+    // Debug output for all arguments
+    LOG_INFO("[DEBUG] handleConfigPage arguments:\n");
+    LOG_INFO("  stroke_time: %ld\n", (long)stroke_time);
+    LOG_INFO("  disengage_time: %ld\n", (long)disengage_time);
+    LOG_INFO("  pwm_freq: %u\n", pwm_freq);
+    LOG_INFO("  pwm_duty: %u\n", pwm_duty);
+    LOG_INFO("  dynamic_pwm_mode: %d (%s)\n", dynamic_pwm_mode, dynamic_pwm_mode ? "checked" : "");
+    LOG_INFO("  advanced div display: %s\n", (dynamic_pwm_mode ? "block" : "none"));
+    LOG_INFO("  dynamic_pwm_min: %u\n", dynamic_pwm_min);
+    LOG_INFO("  dynamic_pwm_max: %u\n", dynamic_pwm_max);
+    LOG_INFO("  dynamic_pwm_engage: %u\n", dynamic_pwm_engage);
+    LOG_INFO("  dynamic_pwm_current: %u\n", dynamic_pwm_current);
+    LOG_INFO("  STALL_PWM_STEP: %u\n", STALL_PWM_STEP);
+    LOG_INFO("  SPEED_CORRECTION_STEP: %u\n", SPEED_CORRECTION_STEP);
+    LOG_INFO("  STALL_COUNT_THRESHOLD_DEFAULT: %u\n", STALL_COUNT_THRESHOLD_DEFAULT);
+    LOG_INFO("  STALL_COUNT_THRESHOLD_AFTER_UNJAM1: %u\n", STALL_COUNT_THRESHOLD_AFTER_UNJAM1);
+    LOG_INFO("  STALL_COUNT_THRESHOLD_AFTER_UNJAM2: %u\n", STALL_COUNT_THRESHOLD_AFTER_UNJAM2);
+    LOG_INFO("  slave_number: %u\n", slave_number);
+    int html_len = snprintf(html, 16384,
         "<html><body style='font-family:monospace; background:#f8f9fa; margin:0; padding:0;'>"
         "<div style='max-width:480px;margin:32px auto 0 auto;padding:24px 24px 16px 24px;background:#fff;border-radius:10px;box-shadow:0 2px 12px #0001;'>"
         "<pre style='font-family:monospace; font-size:16px; text-align:center; margin:0 0 12px 0;'>\r\n"
@@ -564,7 +900,7 @@ void handleConfigPage(AsyncWebServerRequest *request) {
         "/ ___|| | ___  ___ _ __  _   _| |    ___ |  _ \\ __ _ \r\n"
         "\\___ \\| |/ _ \\/ _ \\ '_ \\| | | | |   / _ \\| |_) / _` |\r\n"
         " ___) | |  __/  __/ |_) | |_| | |__| (_) |  _ < (_| |\r\n"
-        "|____/|_|\\___|\\___| .__/ \\,__|_____|\\___/|_| \\_\\__,_|\r\n"
+        "|____/|_|\\___|\\___| .__/ \\__, |_____\\___/|_| \\_\\__,_|\r\n"
         "                  |_|    |___/                       \r\n"
         "</pre>"
         "<h2 style='text-align:center;margin:0 0 18px 0;'>SleepyLora Slave Config</h2>"
@@ -595,6 +931,58 @@ void handleConfigPage(AsyncWebServerRequest *request) {
         "<input type='number' name='pwm_duty' min='0' max='255' value='%u' style='width:100%%;padding:6px;margin-bottom:10px;'><br>"
         "<button type='submit' style='background:#6c757d;color:#fff;font-size:1.1em;padding:8px 24px;border:none;border-radius:6px;cursor:pointer;width:100%%;'>Set Motor PWM</button>"
         "</form>"
+        "<form method='POST' action='/set_dynamic_pwm' style='margin-top:10px;'>"
+        "<label><input type='checkbox' id='dynamic_pwm_mode' name='dynamic_pwm_mode' value='1' %s onchange='toggleAdvanced(this)'> Enable Dynamic PWM (experimental, quieter)</label><br>"
+        "<div id='advanced_pwm' style='display:%s;margin-top:12px;padding:12px 8px 8px 8px;background:#f3f3f3;border-radius:8px;'>"
+        "<style>"
+        ".info-icon { display:inline-block; margin-left:4px; color:#17a2b8; cursor:pointer; font-size:1.1em; vertical-align:middle; }"
+        ".tooltip-text { visibility:hidden; background:#222; color:#fff; text-align:left; border-radius:6px; padding:6px 10px; position:absolute; z-index:10; font-size:0.95em; min-width:180px; left:32px; top:50%%; transform:translateY(-50%%); box-shadow:0 2px 8px #0003; }"
+        ".info-icon.active + .tooltip-text, .info-icon:hover + .tooltip-text { visibility:visible; }"
+        ".tooltip-wrap { position:relative; display:inline-block; }"
+        "@media (hover:none) { .info-icon:hover + .tooltip-text { visibility:hidden; } }"
+        "</style>"
+        "<script>"
+        "document.addEventListener('DOMContentLoaded',function(){"
+        "  document.querySelectorAll('.info-icon').forEach(function(icon){"
+        "    icon.addEventListener('click',function(e){"
+        "      e.stopPropagation();"
+        "      document.querySelectorAll('.info-icon').forEach(function(i){if(i!==icon)i.classList.remove('active');});"
+        "      icon.classList.toggle('active');"
+        "    });"
+        "  });"
+        "  document.body.addEventListener('click',function(){"
+        "    document.querySelectorAll('.info-icon').forEach(function(i){i.classList.remove('active');});"
+        "  });"
+        "});"
+        "</script>"
+        "<label class='tooltip-wrap'>Dynamic PWM Target Stroke Time (ms): <span class='info-icon' tabindex='0'>&#8505;</span><span class='tooltip-text'>Stroke time (ms) used for speed targeting in dynamic PWM mode. Does NOT affect move timeout.</span></label><br>"
+        "<input type='number' name='dynamic_pwm_target_stroke_time' min='1000' max='60000' value='%ld' style='width:100%%;padding:6px;margin-bottom:8px;'><br>"
+        "<label class='tooltip-wrap'>PWM Min: <span class='info-icon' tabindex='0'>&#8505;</span><span class='tooltip-text'>Minimum PWM value during dynamic operation. Lower values = quieter, but may stall.</span></label><br>"
+        "<input type='number' name='dynamic_pwm_min' min='0' max='255' value='%u' style='width:100%%;padding:6px;margin-bottom:8px;'><br>"
+        "<label class='tooltip-wrap'>PWM Max: <span class='info-icon' tabindex='0'>&#8505;</span><span class='tooltip-text'>Maximum PWM value during dynamic operation. Higher values = more power, but louder.</span></label><br>"
+        "<input type='number' name='dynamic_pwm_max' min='0' max='255' value='%u' style='width:100%%;padding:6px;margin-bottom:8px;'><br>"
+        "<label class='tooltip-wrap'>PWM Engage: <span class='info-icon' tabindex='0'>&#8505;</span><span class='tooltip-text'>PWM value used during engage phase (initial movement).</span></label><br>"
+        "<input type='number' name='dynamic_pwm_engage' min='0' max='255' value='%u' style='width:100%%;padding:6px;margin-bottom:8px;'><br>"
+        "<label class='tooltip-wrap'>PWM Current: <span class='info-icon' tabindex='0'>&#8505;</span><span class='tooltip-text'>Current PWM value (runtime, for debugging/tuning).</span></label><br>"
+        "<input type='number' name='dynamic_pwm_current' min='0' max='255' value='%u' style='width:100%%;padding:6px;margin-bottom:8px;'><br>"
+        "<label class='tooltip-wrap'>Stall Step Size: <span class='info-icon' tabindex='0'>&#8505;</span><span class='tooltip-text'>PWM step size when stall detected. Higher = more aggressive recovery.</span></label><br>"
+        "<input type='number' name='stall_pwm_step' min='1' max='100' value='%u' style='width:100%%;padding:6px;margin-bottom:8px;'><br>"
+        "<label class='tooltip-wrap'>Speed Correction Step: <span class='info-icon' tabindex='0'>&#8505;</span><span class='tooltip-text'>PWM step size for normal speed correction. Lower = smoother, higher = faster response.</span></label><br>"
+        "<input type='number' name='speed_correction_step' min='1' max='100' value='%u' style='width:100%%;padding:6px;margin-bottom:8px;'><br>"
+        "<label class='tooltip-wrap'>Stall Count (default): <span class='info-icon' tabindex='0'>&#8505;</span><span class='tooltip-text'>Stall count threshold before recovery is triggered (default).</span></label><br>"
+        "<input type='number' name='stall_count_default' min='1' max='20' value='%u' style='width:100%%;padding:6px;margin-bottom:8px;'><br>"
+        "<label class='tooltip-wrap'>Stall Count (after unjam 1): <span class='info-icon' tabindex='0'>&#8505;</span><span class='tooltip-text'>Stall count threshold after first unjam attempt.</span></label><br>"
+        "<input type='number' name='stall_count_ujam1' min='1' max='20' value='%u' style='width:100%%;padding:6px;margin-bottom:8px;'><br>"
+        "<label class='tooltip-wrap'>Stall Count (after unjam 2): <span class='info-icon' tabindex='0'>&#8505;</span><span class='tooltip-text'>Stall count threshold after second unjam attempt.</span></label><br>"
+        "<input type='number' name='stall_count_ujam2' min='1' max='20' value='%u' style='width:100%%;padding:6px;margin-bottom:8px;'><br>"
+        "<label class='tooltip-wrap'>Unjam Duration 1 (ms): <span class='info-icon' tabindex='0'>&#8505;</span><span class='tooltip-text'>Unjam duration (ms, first attempt). How long to reverse motor to clear jam.</span></label><br>"
+        "<input type='number' name='unjam_duration_1' min='100' max='5000' value='%lu' style='width:100%%;padding:6px;margin-bottom:8px;'><br>"
+        "<label class='tooltip-wrap'>Unjam Duration 2 (ms): <span class='info-icon' tabindex='0'>&#8505;</span><span class='tooltip-text'>Unjam duration (ms, second attempt). Longer for stubborn jams.</span></label><br>"
+        "<input type='number' name='unjam_duration_2' min='100' max='5000' value='%lu' style='width:100%%;padding:6px;margin-bottom:8px;'><br>"
+        "</div>"
+        "<button type='submit' style='background:#20c997;color:#fff;font-size:1.1em;padding:8px 24px;border:none;border-radius:6px;cursor:pointer;width:100%%;margin-top:10px;'>Save PWM Settings</button>"
+        "</form>"
+        "<script>function toggleAdvanced(cb){document.getElementById('advanced_pwm').style.display=cb.checked?'block':'none';}</script>"
         "<hr style='margin:18px 0; border:0; border-top:2px solid #eee;'>"
         "<form method='POST' action='/save'>"
         "<label>Slave Number:</label><br>"
@@ -647,7 +1035,12 @@ void handleConfigPage(AsyncWebServerRequest *request) {
         "});"
         "</script>"
         "</div></body></html>",
-        stroke_time, disengage_time, pwm_freq, pwm_duty,
+        (long)stroke_time, (long)disengage_time, pwm_freq, pwm_duty, dynamic_pwm_mode ? "checked" : "",
+        (dynamic_pwm_mode ? "block" : "none"),
+        (long)dynamic_pwm_target_stroke_time, dynamic_pwm_min, dynamic_pwm_max, dynamic_pwm_engage, dynamic_pwm_current,
+        STALL_PWM_STEP, SPEED_CORRECTION_STEP, STALL_COUNT_THRESHOLD_DEFAULT,
+        STALL_COUNT_THRESHOLD_AFTER_UNJAM1, STALL_COUNT_THRESHOLD_AFTER_UNJAM2,
+        (unsigned long)UNJAM_DURATION, (unsigned long)UNJAM_DURATION_2,
         (slave_number == 1 ? " selected" : ""),
         (slave_number == 2 ? " selected" : ""),
         (slave_number == 3 ? " selected" : ""),
@@ -661,6 +1054,8 @@ void handleConfigPage(AsyncWebServerRequest *request) {
         (slave_number == 11 ? " selected" : ""),
         (slave_number == 12 ? " selected" : "")
     );
+    LOG_INFO("[DEBUG] snprintf returned: %d\n", html_len);
+    if (html_len >= 16384) LOG_WARN("[WARN] HTML output truncated!\n");
     request->send(200, "text/html", html);
     free(html);
 }
@@ -692,6 +1087,66 @@ void handleSetPWM(AsyncWebServerRequest *request) {
     } else {
         request->send(400, "text/html", "<html><body>Missing PWM parameters.<br><a href='/' >Back</a></body></html>");
     }
+}
+
+// Save/load advanced dynamic PWM parameters to/from NVS
+void saveAdvancedPWMSettingsToFlash() {
+    if (prefs.begin("blindcfg", false)) {
+        prefs.putULong("dyn_pwm_target_stroke_time", dynamic_pwm_target_stroke_time);
+        prefs.putUChar("dyn_pwm_min", dynamic_pwm_min);
+        prefs.putUChar("dyn_pwm_max", dynamic_pwm_max);
+        prefs.putUChar("dyn_pwm_engage", dynamic_pwm_engage);
+        prefs.putUChar("dyn_pwm_current", dynamic_pwm_current);
+        prefs.putUChar("stall_pwm_step", STALL_PWM_STEP);
+        prefs.putUChar("spd_corr_step", SPEED_CORRECTION_STEP);
+        prefs.putUChar("stall_cnt_def", STALL_COUNT_THRESHOLD_DEFAULT);
+        prefs.putUChar("stall_cnt_uj1", STALL_COUNT_THRESHOLD_AFTER_UNJAM1);
+        prefs.putUChar("stall_cnt_uj2", STALL_COUNT_THRESHOLD_AFTER_UNJAM2);
+        prefs.putULong("unjam_dur1", UNJAM_DURATION);
+        prefs.putULong("unjam_dur2", UNJAM_DURATION_2);
+        prefs.end();
+    }
+}
+void loadAdvancedPWMSettingsFromFlash() {
+    if (prefs.begin("blindcfg", true)) {
+        dynamic_pwm_target_stroke_time = prefs.getULong("dyn_pwm_target_stroke_time", dynamic_pwm_target_stroke_time);
+        dynamic_pwm_min = prefs.getUChar("dyn_pwm_min", dynamic_pwm_min);
+        dynamic_pwm_max = prefs.getUChar("dyn_pwm_max", dynamic_pwm_max);
+        dynamic_pwm_engage = prefs.getUChar("dyn_pwm_engage", dynamic_pwm_engage);
+        dynamic_pwm_current = prefs.getUChar("dyn_pwm_current", dynamic_pwm_current);
+        STALL_PWM_STEP = prefs.getUChar("stall_pwm_step", STALL_PWM_STEP);
+        SPEED_CORRECTION_STEP = prefs.getUChar("spd_corr_step", SPEED_CORRECTION_STEP);
+        STALL_COUNT_THRESHOLD_DEFAULT = prefs.getUChar("stall_cnt_def", STALL_COUNT_THRESHOLD_DEFAULT);
+        STALL_COUNT_THRESHOLD_AFTER_UNJAM1 = prefs.getUChar("stall_cnt_uj1", STALL_COUNT_THRESHOLD_AFTER_UNJAM1);
+        STALL_COUNT_THRESHOLD_AFTER_UNJAM2 = prefs.getUChar("stall_cnt_uj2", STALL_COUNT_THRESHOLD_AFTER_UNJAM2);
+        UNJAM_DURATION = prefs.getULong("unjam_dur1", UNJAM_DURATION);
+        UNJAM_DURATION_2 = prefs.getULong("unjam_dur2", UNJAM_DURATION_2);
+        prefs.end();
+    }
+}
+
+void handleSetDynamicPWM(AsyncWebServerRequest *request) {
+    LOG_INFO("[DEBUG] handleSetDynamicPWM called\n");
+    // Parse checkbox
+    dynamic_pwm_mode = request->hasParam("dynamic_pwm_mode", true);
+    LOG_INFO("[DEBUG] dynamic_pwm_mode: %d\n", dynamic_pwm_mode);
+    // Parse advanced fields if present, always check for nullptr and use constrain
+    AsyncWebParameter* p;
+    p = request->getParam("dynamic_pwm_target_stroke_time", true); if (p) { dynamic_pwm_target_stroke_time = constrain(p->value().toInt(), 1000, 60000); LOG_INFO("[DEBUG] dynamic_pwm_target_stroke_time: %ld\n", (long)dynamic_pwm_target_stroke_time);} else { LOG_INFO("[DEBUG] dynamic_pwm_target_stroke_time missing\n"); }
+    p = request->getParam("dynamic_pwm_min", true); if (p) { dynamic_pwm_min = constrain(p->value().toInt(), 0, 255); LOG_INFO("[DEBUG] dynamic_pwm_min: %d\n", dynamic_pwm_min); } else { LOG_INFO("[DEBUG] dynamic_pwm_min missing\n"); }
+    p = request->getParam("dynamic_pwm_max", true); if (p) { dynamic_pwm_max = constrain(p->value().toInt(), 0, 255); LOG_INFO("[DEBUG] dynamic_pwm_max: %d\n", dynamic_pwm_max); } else { LOG_INFO("[DEBUG] dynamic_pwm_max missing\n"); }
+    p = request->getParam("dynamic_pwm_engage", true); if (p) { dynamic_pwm_engage = constrain(p->value().toInt(), 0, 255); LOG_INFO("[DEBUG] dynamic_pwm_engage: %d\n", dynamic_pwm_engage); } else { LOG_INFO("[DEBUG] dynamic_pwm_engage missing\n"); }
+    p = request->getParam("dynamic_pwm_current", true); if (p) { dynamic_pwm_current = constrain(p->value().toInt(), 0, 255); LOG_INFO("[DEBUG] dynamic_pwm_current: %d\n", dynamic_pwm_current); } else { LOG_INFO("[DEBUG] dynamic_pwm_current missing\n"); }
+    p = request->getParam("stall_pwm_step", true); if (p) { STALL_PWM_STEP = constrain(p->value().toInt(), 1, 100); LOG_INFO("[DEBUG] stall_pwm_step: %d\n", STALL_PWM_STEP); } else { LOG_INFO("[DEBUG] stall_pwm_step missing\n"); }
+    p = request->getParam("speed_correction_step", true); if (p) { SPEED_CORRECTION_STEP = constrain(p->value().toInt(), 1, 100); LOG_INFO("[DEBUG] speed_correction_step: %d\n", SPEED_CORRECTION_STEP); } else { LOG_INFO("[DEBUG] speed_correction_step missing\n"); }
+    p = request->getParam("stall_count_default", true); if (p) { STALL_COUNT_THRESHOLD_DEFAULT = constrain(p->value().toInt(), 1, 20); LOG_INFO("[DEBUG] stall_count_default: %d\n", STALL_COUNT_THRESHOLD_DEFAULT); } else { LOG_INFO("[DEBUG] stall_count_default missing\n"); }
+    p = request->getParam("stall_count_ujam1", true); if (p) { STALL_COUNT_THRESHOLD_AFTER_UNJAM1 = constrain(p->value().toInt(), 1, 20); LOG_INFO("[DEBUG] stall_count_ujam1: %d\n", STALL_COUNT_THRESHOLD_AFTER_UNJAM1); } else { LOG_INFO("[DEBUG] stall_count_ujam1 missing\n"); }
+    p = request->getParam("stall_count_ujam2", true); if (p) { STALL_COUNT_THRESHOLD_AFTER_UNJAM2 = constrain(p->value().toInt(), 1, 20); LOG_INFO("[DEBUG] stall_count_ujam2: %d\n", STALL_COUNT_THRESHOLD_AFTER_UNJAM2); } else { LOG_INFO("[DEBUG] stall_count_ujam2 missing\n"); }
+    p = request->getParam("unjam_duration_1", true); if (p) { UNJAM_DURATION = constrain(p->value().toInt(), 100, 5000); LOG_INFO("[DEBUG] unjam_duration_1: %lu\n", UNJAM_DURATION); } else { LOG_INFO("[DEBUG] unjam_duration_1 missing\n"); }
+    p = request->getParam("unjam_duration_2", true); if (p) { UNJAM_DURATION_2 = constrain(p->value().toInt(), 100, 5000); LOG_INFO("[DEBUG] unjam_duration_2: %lu\n", UNJAM_DURATION_2); } else { LOG_INFO("[DEBUG] unjam_duration_2 missing\n"); }
+    saveDynamicPWMToFlash(dynamic_pwm_mode);
+    saveAdvancedPWMSettingsToFlash();
+    request->send(200, "text/html", "<html><body>Dynamic PWM and advanced settings saved.<br><a href='/' >Back</a></body></html>");
 }
 
 void startConfigAPAndWebserver() {
@@ -737,7 +1192,7 @@ void startConfigAPAndWebserver() {
             "/ ___|| | ___  ___ _ __  _   _| |    ___ |  _ \\ __ _ \r\n"
             "\\___ \\| |/ _ \\/ _ \\ '_ \\| | | | |   / _ \\| |_) / _` |\r\n"
             " ___) | |  __/  __/ |_) | |_| | |__| (_) |  _ < (_| |\r\n"
-            "|____/|_|\\___|\\___| .__/ \\,__|_____|\\___/|_| \\_\\__,_|\r\n"
+            "|____/|_|\\___|\\___| .__/ \\__, |_____\\___/|_| \\_\\__,_|\r\n"
             "                  |_|    |___/                       \r\n"
             "</pre>"
             "<h2 style='text-align:center;margin:0 0 18px 0;'>SleepyLora Slave Firmware Update</h2>"
@@ -796,6 +1251,7 @@ void startConfigAPAndWebserver() {
     server.on("/set_pwm", HTTP_POST, handleSetPWM);
     server.on("/set_timing", HTTP_POST, handleSetTiming);
     server.on("/autocal", HTTP_POST, handleAutoCalibrate);
+    server.on("/set_dynamic_pwm", HTTP_POST, handleSetDynamicPWM);
     server.begin();
     configPortalActive = true;
     configPortalStartTime = millis();
@@ -826,7 +1282,7 @@ bool isAddressInUse(uint8_t candidate_addr) {
 
     LOG_INFO("[ADDR CHECK] Polling for slave at address 0x%02X...\r\n", candidate_addr);
     LOG_DEBUG("[ADDR CHECK] TX frame: ");
-    for (size_t i = 0; i < sizeof(frame); ++i) LOG_DEBUG_RAW("%02X ", frame[i]);
+    for ( size_t i = 0; i < sizeof(frame); ++i) LOG_DEBUG_RAW("%02X ", frame[i]);
     LOG_DEBUG_RAW("\r\n");
 
     RS485_TRANSMIT();
@@ -906,6 +1362,7 @@ void setup() {
         }
         // Namespace created, write default value
         prefs.putUChar("slave_number", 1);
+       
         slave_number = 1;
         prefs.end();
     } else {
@@ -916,6 +1373,8 @@ void setup() {
     loadRawLimitsFromFlash();
     loadPWMSettingsFromFlash();
     loadTimingSettingsFromFlash();
+    loadDynamicPWMFromFlash();
+    loadAdvancedPWMSettingsFromFlash();
     Serial.begin(115200);
     pinMode(RS485_DIR_PIN, OUTPUT);
     RS485_RECEIVE(); // Default to receive mode
@@ -934,101 +1393,10 @@ void setup() {
       blind_state = STATE_CLOSED;
     }
     setupPWM();
+    stall_count_threshold = STALL_COUNT_THRESHOLD_DEFAULT; // Initialize global stall count threshold
 }
 
-// ===================== Calibration Movement Detection Settings =====================
-// These control how movement is detected during calibration:
-// - MOVEMENT_THRESHOLD: Minimum change in position (raw units) from the start value to consider as movement.
-// - MOVEMENT_CONSECUTIVE_SAMPLES: Number of consecutive samples above threshold required to confirm movement.
-// The engage time is taken from the first sample that exceeds the threshold.
-#define MOVEMENT_THRESHOLD 10
-#define MOVEMENT_CONSECUTIVE_SAMPLES 3
-// ===================================================================================
 
-// Calibration state machine definitions
-
-enum CalibState {
-    CALIB_IDLE = 0,
-    CALIB_START,
-    CALIB_MOVE_TO_CLOSED,
-    CALIB_WAIT_CLOSED,
-    CALIB_FORWARD_STROKE_INIT,
-    CALIB_FORWARD_STROKE,
-    CALIB_FORWARD_DONE,
-    CALIB_REVERSE_STROKE_INIT,
-    CALIB_REVERSE_STROKE,
-    CALIB_REVERSE_DONE,
-    // New states for second cycle
-    CALIB_SECOND_FORWARD_STROKE_INIT,
-    CALIB_SECOND_FORWARD_STROKE,
-    CALIB_SECOND_FORWARD_DONE,
-    CALIB_SECOND_REVERSE_STROKE_INIT,
-    CALIB_SECOND_REVERSE_STROKE,
-    CALIB_SECOND_REVERSE_DONE,
-    CALIB_SAVE,
-    CALIB_COMPLETE,
-    CALIB_ERROR
-};
-
-struct Calibration {
-    CalibState state = CALIB_IDLE;
-    unsigned long start_time = 0;
-    unsigned long move_start_time = 0;
-    unsigned long move_end_time = 0;
-    unsigned long rev_move_start_time = 0;
-    unsigned long rev_move_end_time = 0;
-    unsigned long engage_time = 0;
-    unsigned long forward_stroke_time = 0;
-    unsigned long reverse_engage_time = 0;
-    unsigned long reverse_stroke_time = 0;
-    unsigned long disengage_time_calc = 0; // <-- add this line
-    time_t orig_stroke = 0;
-    time_t orig_disengage = 0;
-    int *pos_samples = nullptr;
-    unsigned long *time_samples = nullptr;
-    int *rev_pos_samples = nullptr;
-    unsigned long *rev_time_samples = nullptr;
-    int sample_count = 400;
-    int baseline_count = 20;
-    int baseline_sum = 0;
-    int baseline = 0;
-    int noise_floor = 0;
-    int move_threshold = 0;
-    int move_start_idx = -1;
-    int move_end_idx = -1;
-    int rev_baseline_sum = 0;
-    int rev_baseline = 0;
-    int rev_noise_floor = 0;
-    int rev_move_threshold = 0;
-    int rev_move_start_idx = -1;
-    int rev_move_end_idx = -1;
-    bool error = false;
-
-    // New fields for simplified calibration
-    unsigned long motor_start_time = 0;
-    unsigned long movement_detected_time = 0;
-    unsigned long target_reached_time = 0;
-    unsigned long last_sample_time = 0;
-    int samples_taken = 0;
-    unsigned long rev_motor_start_time = 0;
-    unsigned long rev_movement_detected_time = 0;
-    unsigned long rev_target_reached_time = 0;
-    unsigned long rev_last_sample_time = 0;
-    int rev_samples_taken = 0;
-        // Second cycle fields
-    unsigned long engage_time2 = 0;
-    unsigned long forward_stroke_time2 = 0;
-    unsigned long reverse_engage_time2 = 0;
-    unsigned long reverse_stroke_time2 = 0;
-    unsigned long disengage_time_calc2 = 0;
-    
-};
-
-Calibration calib;
-
-// Forward declarations for calibration state machine
-void processCalibrationStep();
-void startCalibration();
 
 void loop() {
     static uint8_t buf[1 + 1 + 1 + 8 + 2 + 1];
@@ -1139,23 +1507,31 @@ void startCalibration() {
     if (calib.state != CALIB_IDLE) return;
     calib = Calibration(); // reset
     calib.state = CALIB_START;
+    calib.orig_disengage = disengage_time; // Save original disengage_time
+    disengage_time = 1; // Always set to 1 for calibration, both modes
+    LOG_INFO("[CAL] disengage_time set to 1ms for calibration (all modes)\n");
 }
 
 void processCalibrationStep() {
     // Declare these outside the switch to avoid jump errors
     static unsigned long avg_stroke = 0;
     static unsigned long avg_disengage = 0;
-    // Use defines for engage detection
-    // const int engage_threshold = 18;
-    // const int engage_sustain = 3;
+    // --- Dynamic PWM calibration additions ---
+    static uint16_t forward_pwm_sum = 0, forward_pwm_count = 0;
+    static uint16_t reverse_pwm_sum = 0, reverse_pwm_count = 0;
+    static uint8_t forward_pwm_samples[50];
+    static uint8_t reverse_pwm_samples[50];
+    static uint8_t forward_pwm_second_half_samples[50];
+    static uint8_t forward_pwm_second_half_count = 0;
+    static uint8_t reverse_pwm_second_half_samples[50];
+    static uint8_t reverse_pwm_second_half_count = 0;
+    static unsigned long last_pwm_second_half_sample_time = 0;
     switch (calib.state) {
         case CALIB_IDLE:
             break;
         case CALIB_START:
             LOG_INFO("[CAL] Starting auto calibration routine...\n");
-            calib.orig_disengage = disengage_time;
             calib.orig_stroke = stroke_time;
-            disengage_time = 1;
             stroke_time = 60000;
             calib.state = CALIB_MOVE_TO_CLOSED;
             break;
@@ -1192,6 +1568,11 @@ void processCalibrationStep() {
             targetPos = 1000;
             motor_engaged = true;
             run_motor(0x02, stroke_time);
+            forward_pwm_sum = 0; forward_pwm_count = 0;
+            memset(forward_pwm_samples, 0, sizeof(forward_pwm_samples));
+            forward_pwm_second_half_count = 0;
+            last_pwm_second_half_sample_time = 0;
+            memset(forward_pwm_second_half_samples, 0, sizeof(forward_pwm_second_half_samples));
             break;
         }
         case CALIB_FORWARD_STROKE: {
@@ -1204,9 +1585,25 @@ void processCalibrationStep() {
                 calib.samples_taken++;
             }
             int pos = readPositionRaw();
-            if (!calib.movement_detected_time && abs(pos - calib.baseline) > calib.move_threshold) {
+            if (!calib.movement_detected_time &&
+                isConsecutiveMovementDetected(calib.pos_samples, calib.samples_taken, calib.baseline, calib.move_threshold, MOVEMENT_CONSECUTIVE_SAMPLES)) {
                 calib.movement_detected_time = now;
-                LOG_INFO("[CAL] Forward movement detected at %lu ms\n", now - calib.motor_start_time);
+                LOG_INFO("[CAL] Forward movement detected at %lu ms (consecutive samples)\n", now - calib.motor_start_time);
+                if (dynamic_pwm_mode){
+                    ledcWrite(EN_PWM_CHANNEL, dynamic_pwm_current);
+                    LOG_INFO("[DYN_PWM] Running phase: PWM set to %u\n", dynamic_pwm_current);
+                    dynamic_pwm_in_engage = false;
+                    dynamic_pwm_last_pos = pos;
+                    dynamic_pwm_last_pos_time = now;
+                }
+            }
+
+            // --- Record PWM value for second half of stroke in dynamic mode every 100ms ---
+            if (dynamic_pwm_mode && (now - calib.motor_start_time) >= (4000)) {
+                if ((last_pwm_second_half_sample_time == 0 || now - last_pwm_second_half_sample_time >= 100) && forward_pwm_second_half_count < 50) {
+                    forward_pwm_second_half_samples[forward_pwm_second_half_count++] = dynamic_pwm_current;
+                    last_pwm_second_half_sample_time = now;
+                }
             }
             if (readPosition() > 990) {
                 calib.target_reached_time = now;
@@ -1217,6 +1614,18 @@ void processCalibrationStep() {
             break;
         }
         case CALIB_FORWARD_DONE: {
+            // Calculate average PWM for second half of stroke
+            if (dynamic_pwm_mode && forward_pwm_second_half_count > 0) {
+                uint32_t pwm_sum = 0;
+                for (uint8_t i = 0; i < forward_pwm_second_half_count; ++i) {
+                    pwm_sum += forward_pwm_second_half_samples[i];
+                }
+                uint8_t avg_pwm = pwm_sum / forward_pwm_second_half_count;
+                LOG_INFO("[CAL] Avg PWM (second half of stroke): %u\n", avg_pwm);
+                calib.forward_pwm_avg = avg_pwm;
+            } else {
+                calib.forward_pwm_avg = 0;
+            }
             LOG_INFO("[CAL] Forward stroke samples (up to 50):\n");
             for (int i = 0; i < calib.samples_taken; ++i) {
                 LOG_DEBUG("[CAL] t=%lu pos=%d\n", calib.time_samples[i], calib.pos_samples[i]);
@@ -1237,6 +1646,9 @@ void processCalibrationStep() {
             motor_running = false;
             motor_engaged = false;
             delay(300);
+            calib.motor_start_time_1 = calib.motor_start_time;
+            calib.movement_detected_time_1 = calib.movement_detected_time;
+            calib.target_reached_time_1 = calib.target_reached_time;
             LOG_DEBUG("[CAL] Preparing for reverse stroke: motor stopped, flags reset.\n");
             calib.state = CALIB_REVERSE_STROKE_INIT;
             break;
@@ -1252,15 +1664,20 @@ void processCalibrationStep() {
             calib.rev_pos_samples = (int*)malloc(50 * sizeof(int));
             calib.rev_time_samples = (unsigned long*)malloc(50 * sizeof(unsigned long));
             calib.rev_samples_taken = 0;
-            calib.rev_baseline = readPositionRaw();
-            calib.rev_move_threshold = MOVEMENT_THRESHOLD; // Use configurable threshold
             calib.rev_motor_start_time = millis();
             calib.rev_movement_detected_time = 0;
             calib.rev_target_reached_time = 0;
             calib.rev_last_sample_time = millis();
+            calib.rev_baseline = readPositionRaw();
+            calib.rev_move_threshold = MOVEMENT_THRESHOLD; // Use configurable threshold
             targetPos = 0;
             motor_engaged = true;
             run_motor(0x01, stroke_time);
+            reverse_pwm_sum = 0; reverse_pwm_count = 0;
+            memset(reverse_pwm_samples, 0, sizeof(reverse_pwm_samples));
+            reverse_pwm_second_half_count = 0;
+            last_pwm_second_half_sample_time = 0;
+            memset(reverse_pwm_second_half_samples, 0, sizeof(reverse_pwm_second_half_samples));
             calib.state = CALIB_REVERSE_STROKE;
             break;
         }
@@ -1273,9 +1690,24 @@ void processCalibrationStep() {
                 calib.rev_samples_taken++;
             }
             int pos = readPositionRaw();
-            if (!calib.rev_movement_detected_time && abs(pos - calib.rev_baseline) > calib.rev_move_threshold) {
+            if (!calib.rev_movement_detected_time &&
+                isConsecutiveMovementDetected(calib.rev_pos_samples, calib.rev_samples_taken, calib.rev_baseline, calib.rev_move_threshold, MOVEMENT_CONSECUTIVE_SAMPLES)) {
                 calib.rev_movement_detected_time = now;
-                LOG_INFO("[CAL] Reverse movement detected at %lu ms\n", now - calib.rev_motor_start_time);
+                LOG_INFO("[CAL] Reverse movement detected at %lu ms (consecutive samples)\n", now - calib.rev_motor_start_time);
+                if (dynamic_pwm_mode){
+                    ledcWrite(EN_PWM_CHANNEL, dynamic_pwm_current);
+                    LOG_INFO("[DYN_PWM] Running phase: PWM set to %u\n", dynamic_pwm_current);
+                    dynamic_pwm_in_engage = false;
+                    dynamic_pwm_last_pos = pos;
+                    dynamic_pwm_last_pos_time = now;
+                }
+            }
+            // --- Record PWM value for second half of stroke in dynamic mode every 100ms ---
+            if (dynamic_pwm_mode && (now - calib.rev_motor_start_time) >= (4000)) {
+                if ((last_pwm_second_half_sample_time == 0 || now - last_pwm_second_half_sample_time >= 100) && reverse_pwm_second_half_count < 50) {
+                    reverse_pwm_second_half_samples[reverse_pwm_second_half_count++] = dynamic_pwm_current;
+                    last_pwm_second_half_sample_time = now;
+                }
             }
             if (readPosition() < 10) {
                 calib.rev_target_reached_time = now;
@@ -1286,6 +1718,18 @@ void processCalibrationStep() {
             break;
         }
         case CALIB_REVERSE_DONE: {
+            // Calculate average PWM for second half of stroke
+            if (dynamic_pwm_mode && reverse_pwm_second_half_count > 0) {
+                uint32_t pwm_sum = 0;
+                for (uint8_t i = 0; i < reverse_pwm_second_half_count; ++i) {
+                    pwm_sum += reverse_pwm_second_half_samples[i];
+                }
+                uint8_t avg_pwm = pwm_sum / reverse_pwm_second_half_count;
+                LOG_INFO("[CAL] Avg PWM (second half of stroke): %u\n", avg_pwm);
+                calib.reverse_pwm_avg = avg_pwm;
+            } else {
+                calib.reverse_pwm_avg = 0;
+            }
             LOG_INFO("[CAL] Reverse stroke samples (up to 50):\n");
             for (int i = 0; i < calib.rev_samples_taken; ++i) {
                 LOG_DEBUG("[CAL] t=%lu pos=%d\n", calib.rev_time_samples[i], calib.rev_pos_samples[i]);
@@ -1302,6 +1746,9 @@ void processCalibrationStep() {
                     LOG_WARN("[CAL] Reverse engage not robustly detected, using motor start time.\n");
                 }
             }
+            calib.rev_motor_start_time_1 = calib.rev_motor_start_time;
+            calib.rev_movement_detected_time_1 = calib.rev_movement_detected_time;
+            calib.rev_target_reached_time_1 = calib.rev_target_reached_time;
             // Start second forward stroke
             calib.state = CALIB_SECOND_FORWARD_STROKE_INIT;
             break;
@@ -1322,11 +1769,17 @@ void processCalibrationStep() {
             targetPos = 1000;
             motor_engaged = true;
             run_motor(0x02, stroke_time);
+            forward_pwm_sum = 0; forward_pwm_count = 0;
+            memset(forward_pwm_samples, 0, sizeof(forward_pwm_samples));
+            forward_pwm_second_half_count = 0;
+            last_pwm_second_half_sample_time = 0;
+            memset(forward_pwm_second_half_samples, 0, sizeof(forward_pwm_second_half_samples));
             calib.state = CALIB_SECOND_FORWARD_STROKE;
             break;
         }
         case CALIB_SECOND_FORWARD_STROKE: {
             unsigned long now = millis();
+            // Take samples every 100ms for first 5s
             if (calib.samples_taken < 50 && now - calib.last_sample_time >= 100) {
                 calib.pos_samples[calib.samples_taken] = readPositionRaw();
                 calib.time_samples[calib.samples_taken] = now - calib.motor_start_time;
@@ -1334,9 +1787,24 @@ void processCalibrationStep() {
                 calib.samples_taken++;
             }
             int pos = readPositionRaw();
-            if (!calib.movement_detected_time && abs(pos - calib.baseline) > calib.move_threshold) {
+            if (!calib.movement_detected_time &&
+                isConsecutiveMovementDetected(calib.pos_samples, calib.samples_taken, calib.baseline, calib.move_threshold, MOVEMENT_CONSECUTIVE_SAMPLES)) {
                 calib.movement_detected_time = now;
-                LOG_INFO("[CAL] 2nd Forward movement detected at %lu ms\n", now - calib.motor_start_time);
+                LOG_INFO("[CAL] 2nd Forward movement detected at %lu ms (consecutive samples)\n", now - calib.motor_start_time);
+                if (dynamic_pwm_mode){
+                    ledcWrite(EN_PWM_CHANNEL, dynamic_pwm_current);
+                    LOG_INFO("[DYN_PWM] Running phase: PWM set to %u\n", dynamic_pwm_current);
+                    dynamic_pwm_in_engage = false;
+                    dynamic_pwm_last_pos = pos;
+                    dynamic_pwm_last_pos_time = now;
+                }
+            }
+            // --- Record PWM value for second half of stroke in dynamic mode every 100ms ---
+            if (dynamic_pwm_mode && (now - calib.motor_start_time) >= (4000)) {
+                if ((last_pwm_second_half_sample_time == 0 || now - last_pwm_second_half_sample_time >= 100) && forward_pwm_second_half_count < 50) {
+                    forward_pwm_second_half_samples[forward_pwm_second_half_count++] = dynamic_pwm_current;
+                    last_pwm_second_half_sample_time = now;
+                }
             }
             if (readPosition() > 990) {
                 calib.target_reached_time = now;
@@ -1348,6 +1816,19 @@ void processCalibrationStep() {
         }
         case CALIB_SECOND_FORWARD_DONE: {
             LOG_INFO("[CAL] 2nd Forward stroke samples (up to 50):\n");
+            // Calculate average PWM for second half of stroke
+            if (dynamic_pwm_mode && forward_pwm_second_half_count > 0) {
+                uint32_t pwm_sum = 0;
+                for (uint8_t i = 0; i < forward_pwm_second_half_count; ++i) {
+                    pwm_sum += forward_pwm_second_half_samples[i];
+                }
+                uint8_t avg_pwm = pwm_sum / forward_pwm_second_half_count;
+                LOG_INFO("[CAL] 2nd Avg PWM (second half of stroke): %u\n", avg_pwm);
+                calib.forward_pwm_avg2 = avg_pwm;
+            } else {
+                calib.forward_pwm_avg2 = 0;
+            }
+            LOG_INFO("[CAL] Forward stroke samples (up to 50):\n");
             for (int i = 0; i < calib.samples_taken; ++i) {
                 LOG_DEBUG("[CAL] t=%lu pos=%d\n", calib.time_samples[i], calib.pos_samples[i]);
                 delay(5);
@@ -1391,6 +1872,11 @@ void processCalibrationStep() {
             targetPos = 0;
             motor_engaged = true;
             run_motor(0x01, stroke_time);
+            reverse_pwm_sum = 0; reverse_pwm_count = 0;
+            memset(reverse_pwm_samples, 0, sizeof(reverse_pwm_samples));
+            reverse_pwm_second_half_count = 0;
+            last_pwm_second_half_sample_time = 0;
+            memset(reverse_pwm_second_half_samples, 0, sizeof(reverse_pwm_second_half_samples));
             calib.state = CALIB_SECOND_REVERSE_STROKE;
             break;
         }
@@ -1403,9 +1889,24 @@ void processCalibrationStep() {
                 calib.rev_samples_taken++;
             }
             int pos = readPositionRaw();
-            if (!calib.rev_movement_detected_time && abs(pos - calib.rev_baseline) > calib.rev_move_threshold) {
+            if (!calib.rev_movement_detected_time &&
+                isConsecutiveMovementDetected(calib.rev_pos_samples, calib.rev_samples_taken, calib.rev_baseline, calib.rev_move_threshold, MOVEMENT_CONSECUTIVE_SAMPLES)) {
                 calib.rev_movement_detected_time = now;
-                LOG_INFO("[CAL] 2nd Reverse movement detected at %lu ms\n", now - calib.rev_motor_start_time);
+                LOG_INFO("[CAL] 2nd Reverse movement detected at %lu ms (consecutive samples)\n", now - calib.rev_motor_start_time);
+                if (dynamic_pwm_mode){
+                    ledcWrite(EN_PWM_CHANNEL, dynamic_pwm_current);
+                    LOG_INFO("[DYN_PWM] Running phase: PWM set to %u\n", dynamic_pwm_current);
+                    dynamic_pwm_in_engage = false;
+                    dynamic_pwm_last_pos = pos;
+                    dynamic_pwm_last_pos_time = now;
+                }
+            }
+            // --- Record PWM value for second half of stroke in dynamic mode every 100ms ---
+            if (dynamic_pwm_mode && (now - calib.rev_motor_start_time) >= (4000)) {
+                if ((last_pwm_second_half_sample_time == 0 || now - last_pwm_second_half_sample_time >= 100) && reverse_pwm_second_half_count < 50) {
+                    reverse_pwm_second_half_samples[reverse_pwm_second_half_count++] = dynamic_pwm_current;
+                    last_pwm_second_half_sample_time = now;
+                }
             }
             if (readPosition() < 10) {
                 calib.rev_target_reached_time = now;
@@ -1416,6 +1917,18 @@ void processCalibrationStep() {
             break;
         }
         case CALIB_SECOND_REVERSE_DONE: {
+            // Calculate average PWM for second half of stroke
+            if (dynamic_pwm_mode && reverse_pwm_second_half_count > 0) {
+                uint32_t pwm_sum = 0;
+                for (uint8_t i = 0; i < reverse_pwm_second_half_count; ++i) {
+                    pwm_sum += reverse_pwm_second_half_samples[i];
+                }
+                uint8_t avg_pwm = pwm_sum / reverse_pwm_second_half_count;
+                LOG_INFO("[CAL] Avg PWM (second half of stroke): %u\n", avg_pwm);
+                calib.reverse_pwm_avg2 = avg_pwm;
+            } else {
+                calib.reverse_pwm_avg2 = 0;
+            }
             LOG_INFO("[CAL] 2nd Reverse stroke samples (up to 50):\n");
             for (int i = 0; i < calib.rev_samples_taken; ++i) {
                 LOG_DEBUG("[CAL] t=%lu pos=%d\n", calib.rev_time_samples[i], calib.rev_pos_samples[i]);
@@ -1432,15 +1945,16 @@ void processCalibrationStep() {
                     LOG_WARN("[CAL] 2nd Reverse engage not robustly detected, using motor start time.\n");
                 }
             }
+            
             calib.state = CALIB_SAVE;
             break;
         }
         case CALIB_SAVE: {
             // First cycle
-            calib.engage_time = calib.movement_detected_time - calib.motor_start_time;
-            calib.forward_stroke_time = calib.target_reached_time - calib.movement_detected_time;
-            calib.reverse_engage_time = calib.rev_movement_detected_time - calib.rev_motor_start_time;
-            calib.reverse_stroke_time = calib.rev_target_reached_time - calib.rev_movement_detected_time;
+            calib.engage_time = calib.movement_detected_time_1 - calib.motor_start_time_1;
+            calib.forward_stroke_time = calib.target_reached_time_1 - calib.movement_detected_time_1;
+            calib.reverse_engage_time = calib.rev_movement_detected_time_1 - calib.rev_motor_start_time_1;
+            calib.reverse_stroke_time = calib.rev_target_reached_time_1 - calib.rev_movement_detected_time_1;
             calib.disengage_time_calc = calib.engage_time / 2;
             // Second cycle
             calib.engage_time2 = calib.movement_detected_time - calib.motor_start_time;
@@ -1456,19 +1970,44 @@ void processCalibrationStep() {
             LOG_INFO("[CAL] Averaged stroke_time: %lu ms, disengage_time: %lu ms\n", avg_stroke, avg_disengage);
             disengage_time = avg_disengage;
             stroke_time = avg_stroke;
+            // --- Store dynamic PWM calibration result ---
+            if (dynamic_pwm_mode) {
+                uint32_t sum = 0;
+                uint8_t n = 0;
+                if (calib.forward_pwm_avg > 0) { sum += calib.forward_pwm_avg; n++; }
+                if (calib.reverse_pwm_avg > 0) { sum += calib.reverse_pwm_avg; n++; }
+                if (calib.forward_pwm_avg2 > 0) { sum += calib.forward_pwm_avg2; n++; }
+                if (calib.reverse_pwm_avg2 > 0) { sum += calib.reverse_pwm_avg2; n++; }
+                if (n > 0) {
+                    dynamic_pwm_target = sum / n;
+                    LOG_INFO("[CAL] Set dynamic_pwm_target to %u (avg of 4 strokes)\n", dynamic_pwm_target);
+                } else {
+                    LOG_WARN("[CAL] No valid PWM samples for dynamic calibration!\n");
+                }
+            }
             saveTimingSettingsToFlash(stroke_time, disengage_time);
             LOG_INFO("[CAL] Calibration complete. New stroke_time=%lu ms, disengage_time=%lu ms\n", stroke_time, disengage_time);
             // Disengage actuator with new disengage_time
             disengage_motor();
+            // Save dynamic_pwm_target to flash if in dynamic mode
+            if (dynamic_pwm_mode) {
+                if (prefs.begin("blindcfg", false)) {
+                    prefs.putUChar("dyn_pwm_target", dynamic_pwm_target);
+                    prefs.end();
+                    LOG_INFO("[CAL] Saved dynamic_pwm_target=%u to flash\n", dynamic_pwm_target);
+                } else {
+                    LOG_WARN("[CAL] Could not open NVS to save dynamic_pwm_target\n");
+                }
+            }
             calib.state = CALIB_COMPLETE;
             break;
         }
         case CALIB_COMPLETE: {
-            if (calib.pos_samples) free(calib.pos_samples);
-            if (calib.time_samples) free(calib.time_samples);
-            if (calib.rev_pos_samples) free(calib.rev_pos_samples);
-            if (calib.rev_time_samples) free(calib.rev_time_samples);
-            LOG_INFO("[CAL] Calibration finished.\n");
+            if (calib.pos_samples) { free(calib.pos_samples); calib.pos_samples = nullptr; }
+            if (calib.time_samples) { free(calib.time_samples); calib.time_samples = nullptr; }
+            if (calib.rev_pos_samples) { free(calib.rev_pos_samples); calib.rev_pos_samples = nullptr; }
+            if (calib.rev_time_samples) { free(calib.rev_time_samples); calib.rev_time_samples = nullptr; }
+            LOG_INFO("[CAL] Calibration routine finished.\n");
             // Set blind_state based on final position
             {
                 uint16_t final_pos = readPosition();
@@ -1484,12 +2023,9 @@ void processCalibrationStep() {
             break;
         }
         case CALIB_ERROR: {
-            if (calib.pos_samples) free(calib.pos_samples);
-            if (calib.time_samples) free(calib.time_samples);
-            if (calib.rev_pos_samples) free(calib.rev_pos_samples);
-            if (calib.rev_time_samples) free(calib.rev_time_samples);
-            LOG_ERROR("[CAL] Calibration failed due to error.\n");
-            calib.state = CALIB_IDLE;
+            LOG_ERROR("[CAL] Calibration failed due to error. Restoring disengage_time from flash.\n");
+            loadTimingSettingsFromFlash(); // Restore disengage_time and other timing from flash
+            calib.state = CALIB_COMPLETE;
             break;
         }
     }
