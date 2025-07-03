@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 Chris Huitema
+#pragma once
+
+#include <stdint.h>
 
 #define TIME_SYNC_COMMAND 0xBB
 #define ACK             0xAA
@@ -12,6 +15,7 @@
 #define SET_LIMIT       0x06
 #define GET_LIMIT       0x07
 #define UPDATE_FIRMWARE 0x08
+#define UPDATE_SLAVE    0x09  // Used for web portal/OTA on slave
 
 enum coverState{
   STATE_CLOSING=0x01,
@@ -27,7 +31,7 @@ struct timeSync_t
 {
   uint32_t newTime;
   uint32_t oldTime;
-} timeSyncPayload;
+};
 
 struct status_t
 {
@@ -36,7 +40,7 @@ struct status_t
 	uint16_t awakeTime;
 	uint8_t blindCount;
   uint8_t spare;
-} device_status;
+};
 
 struct blind_t
 {
@@ -45,7 +49,7 @@ struct blind_t
 	uint16_t position;
   uint16_t real_position;
   uint16_t batteryVoltage;
-} blind_status;
+};
 
 struct blind_command_t
 {
@@ -53,7 +57,7 @@ struct blind_command_t
 	uint8_t set_state; // 0x00 = closed, 0x01 = open, 0x03 = stop, 0x04 = set position
 	uint16_t set_position;
   uint32_t spare;
-} blind_command;
+};
 
 struct parameter_t
 {
@@ -64,7 +68,7 @@ struct parameter_t
   uint8_t openTime; // in seconds, gives upto 4min 15seconds open time.
   uint8_t closeTime;
   uint16_t disengageTime; //in ms / 10, gives 0 to 10.2seconds range
-} blind_parameters;
+};
 
 struct limit_t
 {
@@ -73,4 +77,12 @@ struct limit_t
   uint16_t alpha;         //alpha for position averaging
 	uint16_t openValue;     //close value when getting
   uint16_t closeValue;    //open value when getting
-} blind_limits;
+};
+
+// Only declare these as extern in the header, do not define them here
+extern timeSync_t timeSyncPayload;
+extern status_t device_status;
+extern blind_t blind_status;
+extern blind_command_t blind_command;
+extern parameter_t blind_parameters;
+extern limit_t blind_limits;
