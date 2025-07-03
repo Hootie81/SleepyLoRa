@@ -27,7 +27,9 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <Wire.h> // I2C master
-
+#include <nvs_flash.h>
+#include <AsyncEventSource.h>
+#include <algorithm> // For std::min and std::max
 
 #include "LoRa_settings.h"
 #include "Device_settings.h"
@@ -41,6 +43,10 @@
 #include <ESPAsyncWebServer.h>
 #include <vector>
 #include <Update.h>
+
+#include <BlindMotorController.h>
+#include "web_portal.h"
+
 // Debug macros with log levels
 #define DEBUG_SERIAL
 
@@ -95,12 +101,12 @@
 
 #define GET_STATUS 0x08
 #define UPDATE_SLAVE 0x09
-#define UART_TIMEOUT_MS 60
+#define UART_TIMEOUT_MS 90
+#define BLIND_COMMAND 0x03
+
 uint8_t slave_miss_count[MAX_SLAVES+1] = {0}; // Track missed polls per slave
 #define SLAVE_MISS_THRESHOLD 3                // Number of missed polls before marking as not moving
 
-uint16_t closed_raw = 1600; // Default CLOSED_RAW
-uint16_t open_raw = 5;      // Default OPEN_RAW
 int cached_raw_position = 0;
 uint16_t cached_scaled_position = 0;
 
@@ -115,7 +121,6 @@ void processSlaveStatusResponse(uint8_t blind_number, uint8_t state);
 void prepareCommand(uint8_t prep_command, uint8_t blind_number = 0, uint8_t state = 0, uint16_t position = 0, uint16_t real_position = 0, uint8_t last_move_status = 0);
 bool loadConfigFromFlash();
 
-extern bool motor_running;
 bool slave_moving[MAX_SLAVES+1] = {false};
 
 volatile bool configButtonInterruptFlag = false;
@@ -140,7 +145,10 @@ uint32_t config_rf_frequency = 915000000; // Default to AU915 (Australia)
 RTC_DATA_ATTR uint8_t detected_slaves[16] = {0}; // supports up to 15 slaves, 0 = unused
 RTC_DATA_ATTR uint8_t detected_slave_count = 0;
 unsigned long last_slave_poll_time = 0;
+// Provide global access for web_portal.cpp and others
+RTC_DATA_ATTR uint16_t slave_positions[16] = {0};
 
+extern uint16_t slave_positions[];
 unsigned long vbat_keep_on_until = 0;
 
 bool ledOnWhileAwake = false; // Option to control LED while awake
@@ -161,6 +169,11 @@ byte decrypted[16];  //temp storage
 
 Ewma posEwma(POS_ALPHA);
 Ewma battEwma(BATT_ALPHA);
+
+BlindMotorController actuator(
+    IN_A_PIN, IN_B_PIN, EN_PIN, EN_PWM_CHANNEL,
+    POSITION_PIN, POSITION_REF_PIN
+);
 
 /** LoRa callback events */
 static RadioEvents_t RadioEvents;
@@ -243,9 +256,6 @@ bool vext_state = false;
 bool vbat_state = false;
 
 bool slave_reading = false;
-bool motor_running;
-bool motor_engaged;
-RTC_DATA_ATTR bool last_motor_dir;
 
 RTC_DATA_ATTR uint16_t wakeCount;
 RTC_DATA_ATTR time_t awakeTime;
@@ -259,10 +269,8 @@ RTC_DATA_ATTR int posSIM = 0;
 
 bool msgInBuffer = false; // Flag to indicate if a message is in the RX buffer when performing a time sync
 
-// Webserver/AP config
-AsyncWebServer server(80);
-Ticker webserverTimeoutTicker;
-Ticker webPortalPositionTicker;
+
+
 bool configMode = false;
 
 // Buffer for uploaded config file
@@ -279,21 +287,15 @@ void actionCommand(void);
 void parsePacket(void);
 void performTimeSync(void);
 uint16_t checkBAT(void);
-void run_motor(uint8_t dir, int runtime);
-void disengage_motor(void);
-void update_motor(void);
-void stop_motor(void);
 void print_reset_reason(RESET_REASON reason);
 void startConfigAPAndWebserver();
 void stopConfigAPAndWebserver();
 void scanUARTSlavesAndPublish();
-uint16_t readPosition(void);
-int readPositionRaw(void);
 const char* getMoveStatusString(uint8_t status);
 void handleSetClosedLimit(AsyncWebServerRequest *request);
 void handleSetOpenLimit(AsyncWebServerRequest *request);
 void handleGetPosition(AsyncWebServerRequest *request);
-void pollAndUpdatePosition();
+void updateVBATState();
 bool isConfigMissing() {
   return !loadConfigFromFlash();
 }
@@ -303,6 +305,8 @@ bool any_slave_moving() {
   }
   return false;
 }
+void loadTimingSettingsFromFlash();
+void handleAutoCalibrate(AsyncWebServerRequest *request);
 
 // Helper: hex string to bytes
 bool hexToBytes(const char* hex, uint8_t* buf, size_t len) {
@@ -406,7 +410,7 @@ void processSlaveStatusResponse(uint8_t blind_number, uint8_t state) {
           slave_moving[blind_number] = false;
           // If the slave was moving and now stopped, keep vBAT on for disengage_time
           if (was_moving) {
-              setVBATKeepOn(disengage_time + 500);
+              setVBATKeepOn(2000);
           }
       }
   }
@@ -453,6 +457,8 @@ void scanUARTSlavesAndPublish() {
                   detected_slaves[detected_slave_count++] = blind_number;
               }
               uint16_t battery = 0;
+              // --- Update slave_positions ---
+              slave_positions[blind_number] = position;
           }
       } else {
           LOG_WARN("[UART RX] No valid response\r\n");
@@ -492,6 +498,8 @@ void pollSlaveStatusUART(uint8_t blind_number) {
         getMoveStatusString(last_move_status));
       // Send the received data to the gateway
       slave_miss_count[blind_number] = 0; // Reset on success
+      // --- Update slave_positions ---
+      slave_positions[blind_number] = position;
       prepareCommand(BLIND_STATUS, blind_number, state, position, position, last_move_status);
   } else {
       LOG_WARN("No response from slave %u\r\n", blind_number);
@@ -509,102 +517,6 @@ void pollSlaveStatusUART(uint8_t blind_number) {
           LOG_WARN("\r\n");
       }
   }
-}
-
-void ensureVBATOn() {
-  if (!vbat_state) {
-      vBAT(true);
-      vEXT(true); // Ensure logic shifter is on for RS485
-      delay(VBAT_BOOT_MS);
-  } else if (!vext_state) {
-      vEXT(true); // If vBAT is already on, still ensure vEXT is on
-  }
-}
-
-void setVBATKeepOn(unsigned long duration_ms) {
-  unsigned long new_until = millis() + duration_ms;
-  if (new_until > vbat_keep_on_until) vbat_keep_on_until = new_until;
-}
-
-void updateVBATState() {
-  if (!motor_running && !any_slave_moving() && !slave_reading && millis() > vbat_keep_on_until) {
-      vBAT(false);
-  } 
-}
-
-// Save config to flash
-void saveConfigToFlash() {
-prefs.begin("loracfg", false);
-prefs.putUInt("gatewayID", config_gatewayID);
-prefs.putBytes("aes_key", config_aes_key, 16);
-prefs.putBytes("hmacKey", config_hmacKey, 10);
-prefs.putUInt("rf_frequency", config_rf_frequency);
-prefs.end();
-}
-
-// Load config from flash, return true if found
-bool loadConfigFromFlash() {
-prefs.begin("loracfg", true);
-bool found = prefs.isKey("gatewayID") && prefs.isKey("aes_key") && prefs.isKey("hmacKey");
-if (found) {
-  config_gatewayID = prefs.getUInt("gatewayID", 0);
-  prefs.getBytes("aes_key", config_aes_key, 16);
-  prefs.getBytes("hmacKey", config_hmacKey, 10);
-  if (prefs.isKey("rf_frequency"))
-    config_rf_frequency = prefs.getUInt("rf_frequency", 868100000);
-  else
-    config_rf_frequency = 868100000;
-}
-prefs.end();
-return found;
-}
-
-void loadRawLimitsFromFlash() {
-    prefs.begin("blindcfg", true);
-    closed_raw = prefs.getUShort("closed_raw", 1600);
-    open_raw = prefs.getUShort("open_raw", 5);
-    prefs.end();
-}
-
-void saveRawLimitsToFlash(uint16_t closed, uint16_t open) {
-    prefs.begin("blindcfg", false);
-    prefs.putUShort("closed_raw", closed);
-    prefs.putUShort("open_raw", open);
-    prefs.end();
-}
-
-void handleSetClosedLimit(AsyncWebServerRequest *request) {
-    int raw = readPositionRaw();
-    LOG_INFO("[WEB] Set Closed Limit requested. Current raw: %d, Open raw: %d\n", raw, open_raw);
-    if (abs(raw - open_raw) < 100) {
-        LOG_WARN("[WEB] Closed limit validation failed: difference < 100 or equal.\n");
-        request->send(400, "text/html",
-            "<html><body>Error: Closed and Open limits must differ by at least 100 raw units and cannot be equal.<br>"
-            "<a href='/'>Back</a></body></html>");
-        return;
-    }
-    closed_raw = raw;
-    saveRawLimitsToFlash(closed_raw, open_raw);
-    LOG_INFO("[WEB] Closed limit set to %d and saved to flash.\n", closed_raw);
-    request->send(200, "text/html",
-        "<html><body>Closed limit set to current position (" + String(raw) + ").<br><a href='/'>Back</a></body></html>");
-}
-
-void handleSetOpenLimit(AsyncWebServerRequest *request) {
-    int raw = readPositionRaw();
-    LOG_INFO("[WEB] Set Open Limit requested. Current raw: %d, Closed raw: %d\n", raw, closed_raw);
-    if (abs(closed_raw - raw) < 100) {
-        LOG_WARN("[WEB] Open limit validation failed: difference < 100 or equal.\n");
-        request->send(400, "text/html",
-            "<html><body>Error: Closed and Open limits must differ by at least 100 raw units and cannot be equal.<br>"
-            "<a href='/'>Back</a></body></html>");
-        return;
-    }
-    open_raw = raw;
-    saveRawLimitsToFlash(closed_raw, open_raw);
-    LOG_INFO("[WEB] Open limit set to %d and saved to flash.\n", open_raw);
-    request->send(200, "text/html",
-        "<html><body>Open limit set to current position (" + String(raw) + ").<br><a href='/'>Back</a></body></html>");
 }
 
 bool isConfigButtonPressed() {
@@ -652,124 +564,25 @@ void handleConfigButton() {
     wasPressed = pressed;
 }
 
-// Update webserver handlers to use config variables
-void handleConfigPage(AsyncWebServerRequest *request) {
-  char html[8192];
-  char aesKeyHex[33] = {0};
-  char hmacKeyHex[21] = {0};
-  for (int i = 0; i < 16; ++i) sprintf(&aesKeyHex[i*2], "%02X", config_aes_key[i]);
-  for (int i = 0; i < 10; ++i) sprintf(&hmacKeyHex[i*2], "%02X", config_hmacKey[i]);
-  snprintf(html, sizeof(html),
-  "<html><body style='font-family:monospace; background:#f8f9fa; margin:0; padding:0;'>"
-  "<div style='max-width:480px;margin:32px auto 0 auto;padding:24px 24px 16px 24px;background:#fff;border-radius:10px;box-shadow:0 2px 12px #0001;'>"
-  "<pre style='font-family:monospace; font-size:16px; text-align:center; margin:0 0 12px 0;'>\r\n"
-  " ____  _                       _          ____       \r\n"
-  "/ ___|| | ___  ___ _ __  _   _| |    ___ |  _ \\ __ _ \r\n"
-  "\\___ \\| |/ _ \\/ _ \\ '_ \\| | | | |   / _ \\| |_) / _` |\r\n"
-  " ___) | |  __/  __/ |_) | |_| | |__| (_) |  _ < (_| |\r\n"
-  "|____/|_|\\___|\\___| .__/ \\__, |_____\\___/|_| \\_\\__,_|\r\n"
-  "                  |_|    |___/                       \r\n"
-  "</pre>"
-  "<h2 style='text-align:center;margin:0 0 18px 0;'>SleepyLora Blinds Config</h2>"
-  "<div id='livepos' style='text-align:center;font-size:1.1em;margin-bottom:16px;'>"
-  "Raw Position: <span id='rawpos'>...</span>  Blind Position: <span id='blindpos'>...</span>%%"
-  "</div>"
-  "<form method='POST' action='/set_closed' style='margin-top:10px;'>"
-  "<button type='submit' style='background:#ffc107;color:#222;font-size:1.1em;padding:8px 24px;border:none;border-radius:6px;cursor:pointer;width:100%%;'>Set Closed Limit (Current Position)</button>"
-  "</form>"
-  "<form method='POST' action='/set_open' style='margin-top:10px;'>"
-  "<button type='submit' style='background:#17a2b8;color:#fff;font-size:1.1em;padding:8px 24px;border:none;border-radius:6px;cursor:pointer;width:100%%;'>Set Open Limit (Current Position)</button>"
-  "</form>"
-  "<hr style='margin:18px 0; border:0; border-top:2px solid #eee;'>"
-  "<div style='border:2px solid #007bff; background:#e9f5ff; border-radius:8px; padding:14px 12px 10px 12px; margin-bottom:18px;'>"
-    "<h3 style='margin:0 0 8px 0; color:#007bff;'>Load Configuration from File</h3>"
-    "<div style='font-size:14px; margin-bottom:8px;'>"
-      "You can quickly load all settings from a previously saved file."
-    "</div>"
-    "<form id='loadfileform' method='POST' action='/loadfile' enctype='multipart/form-data'>"
-      "<input type='file' id='keyfile' name='file' accept='.json' style='margin-bottom:8px;'>"
-      "<button type='button' onclick='loadKeysFromFile(event)' style='background:#007bff;color:#fff;padding:6px 18px;border:none;border-radius:5px;cursor:pointer;'>Load</button>"
-    "</form>"
-    "<div style='font-size:13px; color:#555; margin-top:6px;'>"
-      "After loading, review the fields and press Save to apply."
-    "</div>"
-  "</div>"
 
-  "<form id='cfgform' method='POST' action='/save'>"
-  "<label>Gateway ID:</label><br>"
-  "<input name='gatewayID' id='gatewayID' value='%08X' style='width:100%%;padding:6px;margin-bottom:10px;'><br>"
-  "<label>AES Key (hex, 16 bytes):</label><br>"
-  "<input name='aes_key' id='aes_key' value='%s' maxlength='32' size='34' style='width:100%%;padding:6px;margin-bottom:10px;'><br>"
-  "<label>HMAC Key (hex, 10 bytes):</label><br>"
-  "<input name='hmacKey' id='hmacKey' value='%s' maxlength='20' size='22' style='width:100%%;padding:6px;margin-bottom:10px;'><br>"
-  "<label>LoRa Region/Frequency:</label><br>"
-  "<select name='rf_frequency' id='rf_frequency' style='width:100%%;padding:6px;margin-bottom:10px;'>"
-  "<option value='868100000'%s>EU868 (868.1 MHz)</option>"
-  "<option value='915000000'%s>US915/AU915 (915 MHz)</option>"
-  "<option value='923200000'%s>AS923 (923.2 MHz)</option>"
-  "<option value='920900000'%s>KR920 (920.9 MHz)</option>"
-  "<option value='865062500'%s>IN865 (865.0625 MHz)</option>"
-  "<option value='433175000'%s>EU433 (433.175 MHz)</option>"
-  "<option value='470300000'%s>CN470 (470.3 MHz)</option>"
-  "</select><br>"
-  "<button type='submit' style='background:#28a745;color:#fff;font-size:1.2em;padding:10px 32px;border:none;border-radius:6px;cursor:pointer;margin-top:10px;width:100%%;'>Save</button>"
-  "</form>"
-  "<div style='margin-top:18px; text-align:center;'>"
-  "<a href='/upload' style='color:#007bff; font-size:1.1em; text-decoration:underline;'>Update Firmware from File</a>"
-  "</div>"
-  "<script>\r\n"
-  "function setField(id, val) {\r\n"
-  "  var el = document.getElementById(id);\r\n"
-  "  if (el) el.value = val;\r\n"
-  "}\r\n"
-  "function setSelect(id, val) {\r\n"
-  "  var el = document.getElementById(id);\r\n"
-  "  if (el) el.value = val;\r\n"
-  "}\r\n"
-  "function loadKeysFromFile(event) {\r\n"
-  "  var fileInput = document.getElementById('keyfile');\r\n"
-  "  if (!fileInput.files.length) { alert('No file selected'); return; }\r\n"
-  "  var reader = new FileReader();\r\n"
-  "  reader.onload = function(e) {\r\n"
-  "    try {\r\n"
-  "      var data = JSON.parse(e.target.result);\r\n"
-  "      if (data.gatewayID) setField('gatewayID', (typeof data.gatewayID === 'string' ? data.gatewayID : data.gatewayID.toString(16).toUpperCase().padStart(8, '0')));\r\n"
-  "      if (data.aes_key) setField('aes_key', data.aes_key);\r\n"
-  "      if (data.hmacKey) setField('hmacKey', data.hmacKey);\r\n"
-  "      if (data.hmac_key) setField('hmacKey', data.hmac_key);\r\n"
-  "      if (data.rf_frequency) setSelect('rf_frequency', data.rf_frequency);\r\n"
-  "      alert('Config loaded! Review and press Save to apply.');\r\n"
-  "    } catch (err) {\r\n"
-  "      alert('Invalid JSON file.');\r\n"
-  "    }\r\n"
-  "  };\r\n"
-  "  reader.readAsText(fileInput.files[0]);\r\n"
-  "}\r\n"
-  "</script>"
-  "<form method='POST' action='/close' style='margin-top:18px; text-align:center;'>"
-  "<button type='submit' style='background:#dc3545;color:#fff;font-size:1.1em;padding:8px 24px;border:none;border-radius:6px;cursor:pointer;'>Close Web Portal & Sleep</button>"
-  "</form>"
-  "<script>"
-  "function updatePos() {"
-  "  fetch('/position').then(r=>r.json()).then(d=>{"
-  "    document.getElementById('rawpos').textContent = d.raw;"
-  "    document.getElementById('blindpos').textContent = d.percent.toFixed(1);"
-  "  });"
-  "}"
-  "setInterval(updatePos, 1000);"
-  "updatePos();"
-  "</script>"
-  "</body></html>",
-    config_gatewayID, aesKeyHex, hmacKeyHex,
-    config_rf_frequency == 868100000 ? " selected" : "",
-    config_rf_frequency == 915000000 ? " selected" : "",
-    config_rf_frequency == 923200000 ? " selected" : "",
-    config_rf_frequency == 920900000 ? " selected" : "",
-    config_rf_frequency == 865062500 ? " selected" : "",
-    config_rf_frequency == 433175000 ? " selected" : "",
-    config_rf_frequency == 470300000 ? " selected" : "");
-  request->send(200, "text/html", html);
+
+// Save config to flash
+void saveConfigToFlash() {
+prefs.begin("loracfg", false);
+prefs.putUInt("gatewayID", config_gatewayID);
+prefs.putBytes("aes_key", config_aes_key, 16);
+prefs.putBytes("hmacKey", config_hmacKey, 10);
+prefs.putUInt("rf_frequency", config_rf_frequency);
+prefs.end();
 }
+void eraseNVSAndReboot() {
+    LOG_ERROR("[NVS] Erasing NVS partition and rebooting...\n");
+    nvs_flash_erase();
+    nvs_flash_init();
+    delay(100);
+    ESP.restart();
+}
+
 
 void handleSaveConfig(AsyncWebServerRequest *request) {
   if (request->hasParam("gatewayID", true) && request->hasParam("aes_key", true) && request->hasParam("hmacKey", true)) {
@@ -790,143 +603,21 @@ void handleSaveConfig(AsyncWebServerRequest *request) {
   }
 }
 
-// New upload handler for /loadfile
-void onLoadFileUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-  if (index == 0) {
-    uploadedConfigFile = "";
-  }
-  for (size_t i = 0; i < len; i++) {
-    uploadedConfigFile += (char)data[i];
-  }
-  if (final) {
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, uploadedConfigFile);
-    if (err) {
-      request->send(400, "text/html", "<html><body>Invalid JSON.<br><a href='/'>Back</a></body></html>");
-      return;
-    }
-    if (!doc["gatewayID"].is<uint32_t>() || !doc["aes_key"].is<const char*>() || !doc["hmacKey"].is<const char*>()) {
-      request->send(400, "text/html", "<html><body>Missing fields in JSON.<br><a href='/'>Back</a></body></html>");
-      return;
-    }
-    uint32_t gwid = doc["gatewayID"].as<uint32_t>();
-    const char* aesStr = doc["aes_key"];
-    const char* hmacStr = doc["hmacKey"];
-    uint32_t rf_freq = doc["rf_frequency"].is<uint32_t>() ? doc["rf_frequency"].as<uint32_t>() : 868100000;
-    if (strlen(aesStr) != 32 || strlen(hmacStr) != 20) {
-      request->send(400, "text/html", "<html><body>Key lengths invalid.<br><a href='/'>Back</a></body></html>");
-      return;
-    }
-    uint8_t aesBuf[16];
-    uint8_t hmacBuf[10];
-    if (!hexToBytes(aesStr, aesBuf, 16) || !hexToBytes(hmacStr, hmacBuf, 10)) {
-      request->send(400, "text/html", "<html><body>Key format invalid.<br><a href='/'>Back</a></body></html>");
-      return;
-    }
-    config_gatewayID = gwid;
-    memcpy(config_aes_key, aesBuf, 16);
-    memcpy(config_hmacKey, hmacBuf, 10);
-    config_rf_frequency = rf_freq;
-    saveConfigToFlash();
-    request->send(200, "text/html", "<html><body>Config loaded from file!<br><a href='/'>Back</a></body></html>");
-    configMode = false;
-  }
+// Load config from flash, return true if found
+bool loadConfigFromFlash() {
+prefs.begin("loracfg", true);
+bool found = prefs.isKey("gatewayID") && prefs.isKey("aes_key") && prefs.isKey("hmacKey");
+if (found) {
+  config_gatewayID = prefs.getUInt("gatewayID", 0);
+  prefs.getBytes("aes_key", config_aes_key, 16);
+  prefs.getBytes("hmacKey", config_hmacKey, 10);
+  if (prefs.isKey("rf_frequency"))
+    config_rf_frequency = prefs.getUInt("rf_frequency", 868100000);
+  else
+    config_rf_frequency = 868100000;
 }
-
-void startConfigAPAndWebserver() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP("SleepyLoRaMaster", "blind1234");
-  webPortalPositionTicker.attach_ms(500, pollAndUpdatePosition);
-  server.on("/", HTTP_GET, handleConfigPage);
-  server.on("/save", HTTP_POST, handleSaveConfig);
-  server.on("/close", HTTP_POST, [](AsyncWebServerRequest *request){
-    request->send(200, "text/html", "<html><body>Web portal closed. Device will sleep.<br><a href='/'>Back</a></body></html>");
-    // Stop the webserver and go to sleep after a short delay to allow the response to be sent
-    configPortalActive = false;
-    webserverTimeoutTicker.detach();
-    delay(200);
-    stopConfigAPAndWebserver();
-});
-  server.on("/upload", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send(200, "text/html",
-        "<html><body style='font-family:monospace; background:#f8f9fa; margin:0; padding:0;'>"
-        "<div style='max-width:480px;margin:32px auto 0 auto;padding:24px 24px 16px 24px;background:#fff;border-radius:10px;box-shadow:0 2px 12px #0001;'>"
-        "<pre style='font-family:monospace; font-size:16px; text-align:center; margin:0 0 12px 0;'>\r\n"
-        " ____  _                       _          ____       \r\n"
-        "/ ___|| | ___  ___ _ __  _   _| |    ___ |  _ \\ __ _ \r\n"
-        "\\___ \\| |/ _ \\/ _ \\ '_ \\| | | | |   / _ \\| |_) / _` |\r\n"
-        " ___) | |  __/  __/ |_) | |_| | |__| (_) |  _ < (_| |\r\n"
-        "|____/|_|\\___|\\___| .__/ \\__, |_____\\___/|_| \\_\\__,_|\r\n"
-        "                  |_|    |___/                       \r\n"
-        "</pre>"
-        "<h2 style='text-align:center;margin:0 0 18px 0;'>SleepyLora Blinds Firmware Update</h2>"
-        "<form method='POST' action='/update' enctype='multipart/form-data'>"
-        "<input type='file' name='update' style='margin-bottom:12px;'>"
-        "<br><input type='submit' value='Update' style='background:#007bff;color:#fff;padding:6px 18px;border:none;border-radius:5px;cursor:pointer;'>"
-        "</form>"
-        "<div style='margin-top:18px; text-align:center;'>"
-        "<a href='/' style='color:#007bff; font-size:1.1em; text-decoration:underline;'>Back to Config</a>"
-        "</div>"
-        "</div></body></html>"
-    );
-  });
-  server.on("/update", HTTP_POST, [](AsyncWebServerRequest *request){
-    bool shouldReboot = !Update.hasError();
-    AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", shouldReboot ? "OK" : "FAIL");
-    response->addHeader("Connection", "close");
-    request->send(response);
-    if (shouldReboot) {
-        delay(100);
-        ESP.restart();
-    }
-  }, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final){
-    if (!index) {
-        Serial.printf("Update Start: %s\n", filename.c_str());
-        Update.begin(UPDATE_SIZE_UNKNOWN);
-    }
-    if (Update.write(data, len) != len) {
-        Serial.println("Update Write Failed");
-    }
-    if (final) {
-        if (Update.end(true)) {
-            Serial.println("Update Success");
-        } else {
-            Serial.println("Update Failed");
-        }
-    }
-  });
-  server.on("/loadfile", HTTP_POST, [](AsyncWebServerRequest *request) {
-    // This will be called after upload is complete if no upload handler is set, so just do nothing here
-  }, onLoadFileUpload);
-  server.on("/download_keys", HTTP_GET, [](AsyncWebServerRequest *request){
-    char aesKeyHex[33] = {0};
-    char hmacKeyHex[21] = {0};
-    for (int i = 0; i < 16; ++i) sprintf(&aesKeyHex[i*2], "%02X", config_aes_key[i]);
-    for (int i = 0; i < 10; ++i) sprintf(&hmacKeyHex[i*2], "%02X", config_hmacKey[i]);
-    String json = String("{\"gatewayID\":\"") + String(config_gatewayID, HEX) + "\"," +
-        "\"aes_key\":\"" + aesKeyHex + "\"," +
-        "\"hmacKey\":\"" + hmacKeyHex + "\"," +
-        "\"rf_frequency\":" + String(config_rf_frequency) + "}";
-    request->send(200, "application/json", json);
-  });
-
-  server.on("/set_closed", HTTP_POST, handleSetClosedLimit);
-  server.on("/set_open", HTTP_POST, handleSetOpenLimit);
-  server.on("/position", HTTP_GET, handleGetPosition);
-  server.begin();
-  configMode = true;
-  // Set 5 min timeout
-  webserverTimeoutTicker.once_ms(300000, [](){
-    stopConfigAPAndWebserver();
-    goToSleep();
-  });
-}
-
-void stopConfigAPAndWebserver() {
-  webPortalPositionTicker.detach();
-  server.end();
-  WiFi.mode(WIFI_OFF);
-  configMode = false;
+prefs.end();
+return found;
 }
 
 const char* getMoveStatusString(uint8_t status) {
@@ -971,12 +662,6 @@ void setup() {
     digitalWrite(LED_PIN, LOW);
   }
 
-  pinMode(IN_A_PIN, OUTPUT);
-  pinMode(IN_B_PIN, OUTPUT);
-  pinMode(EN_PIN, OUTPUT);
-  digitalWrite(IN_A_PIN, LOW);
-  digitalWrite(IN_B_PIN, LOW);
-  digitalWrite(EN_PIN, LOW);
   Serial1.begin(UART_BAUDRATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
   Serial.begin(115200);
   if ((cpu0WakeupReason == POWERON_RESET) || (cpu1WakeupReason == POWERON_RESET)) {
@@ -995,27 +680,13 @@ void setup() {
   gettimeofday(&tv_now, NULL);
   int64_t time = (int64_t)tv_now.tv_sec;
   LOG_INFO("Time at wakeup: %lld\r\n", time);
-
-  LOG_INFO("#####################################\r\n");
-  LOG_INFO("#             Device                #\r\n");
-  if (SIMULATOR) {
-    LOG_INFO("# !!! Running position Simulator    #\r\n");
-  }
-  LOG_INFO("#####################################\r\n");
-
   pinMode(BATTERY_PIN, OUTPUT);
   digitalWrite(BATTERY_PIN, HIGH);
-
   analogReadResolution(12);
   analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);  // Sets the input attenuation, default is ADC_11db, range is ADC_0db, ADC_2_5db, ADC_6db, ADC_11db
   adcAttachPin(BATTERY_ADC_PIN);
 
-  analogSetPinAttenuation(POSITION_PIN, ADC_11db);  // Sets the input attenuation, default is ADC_11db, range is ADC_0db, ADC_2_5db, ADC_6db, ADC_11db
-  adcAttachPin(POSITION_PIN);
-  analogSetPinAttenuation(POSITION_REF_PIN, ADC_11db);  // Sets the input attenuation, default is ADC_11db, range is ADC_0db, ADC_2_5db, ADC_6db, ADC_11db
-  adcAttachPin(POSITION_REF_PIN);
 
-  // Slowing down the ESP32 to 1/4 of its speed saves more energy
   setCpuFrequencyMhz(80);
 
   // Create node ID
@@ -1025,7 +696,6 @@ void setup() {
   deviceID += (uint32_t)deviceMac[3] << 8;
   deviceID += (uint32_t)deviceMac[4] << 16;
   deviceID += (uint32_t)deviceMac[5] << 24;
-  loadRawLimitsFromFlash();
   LOG_INFO("Device ID %08X using frequency %.1f MHz\r\r\n", deviceID, (double)(config_rf_frequency / 1000000.0));
   if (
     ((cpu0WakeupReason == POWERON_RESET || cpu1WakeupReason == POWERON_RESET) && digitalRead(CONFIG_BTN_INPUT) == LOW)
@@ -1035,7 +705,8 @@ void setup() {
     ) {
     // Button held during power-on or config missing: start config portal
     LOG_INFO("AP and Webserver started\r\n");
-    startConfigAPAndWebserver();
+    startConfigAPAndWebserver(actuator);
+    
     while (configMode) {
       delay(100);
     }
@@ -1053,6 +724,9 @@ void setup() {
   if ((cpu0WakeupReason == POWERON_RESET) || (cpu1WakeupReason == POWERON_RESET)) {
     scanUARTSlavesAndPublish();
   }
+
+  actuator.begin();
+
   LOG_INFO("Setup finished\r\n");
   LOG_INFO("millis(): %lu\r\n", millis());
 }
@@ -1060,7 +734,6 @@ void setup() {
 void loop() {
     Radio.IrqProcess(); // Process radio interrupts first
     handleConfigButton();
-    update_motor();
 
     if (commandReady) {
         actionCommand();
@@ -1070,11 +743,21 @@ void loop() {
     if (!loraRXbuffer.isEmpty() && !(timeSync > 0 && buff_size == loraRXbuffer.size())) {
         parsePacket();
     }
+    static BlindMotorState lastState = BlindMotorState::IDLE;
+    BlindMotorState currentState = actuator.getState();
+    if ((lastState == BlindMotorState::MOVING || lastState == BlindMotorState::DISENGAGING) &&
+        currentState == BlindMotorState::IDLE) {
+        // Move just finished, send final status update
+        actuator.reportStatus();
+        prepareCommand(BLIND_STATUS, 0, actuator.getCoverState(), actuator.readPositionPercent(), actuator.readPositionRaw(), actuator.getLastMoveStatus());
+    }
+    lastState = currentState;
 
-    if (motor_running) {
+    if (actuator.isMotorRunning()) {
       if (millis() - status_update > MOVING_UPDATE_PERIOD) {
         status_update = millis();
-        prepareCommand(BLIND_STATUS, 0, blind_state, readPosition(), readPosition(), last_move_status);
+        actuator.reportStatus();
+        prepareCommand(BLIND_STATUS, 0, actuator.getCoverState(), actuator.readPositionPercent(), actuator.readPositionPercent(), actuator.getLastMoveStatus());
       }
     }
     if (any_slave_moving()) {
@@ -1088,12 +771,12 @@ void loop() {
         }
       }
     }
-    if (configPortalActive && millis() - configPortalStartTime > 5 * 60 * 1000) {
+    if (configPortalActive && millis() - configPortalStartTime > 10 * 60 * 1000) {
         stopConfigAPAndWebserver(); // Your function to stop the web portal
         configPortalActive = false;
     }
     if (millis() - wakeup > MAX_AWAKE_TIME) {
-        LOG_WARN("5min timeout\r\n");
+        LOG_WARN("10min timeout\r\n");
         timeSync = 0;
         lastTimeSync = 0;
         goToSleep();
@@ -1129,12 +812,8 @@ void loop() {
             lastSend = time;
             slave_reading = true;
             prepareCommand(DEVICE_STATUS);
-            uint16_t pos = readPosition();
-            if (blind_state != STATE_OPEN && blind_state != STATE_CLOSED && blind_state != STATE_OPENING && blind_state != STATE_CLOSING) {
-                blind_state = (pos > 10) ? STATE_OPEN : STATE_CLOSED;
-            }
-            prepareCommand(BLIND_STATUS, 0, blind_state, readPosition(), readPosition(), last_move_status);
-            
+            prepareCommand(BLIND_STATUS, 0, actuator.getCoverState(), actuator.readPositionPercent(), actuator.readPositionPercent(), actuator.getLastMoveStatus());
+
             if (detected_slave_count > 0) ensureVBATOn();
             for (uint8_t i = 0; i < detected_slave_count; ++i) {
               pollSlaveStatusUART(detected_slaves[i]);
@@ -1143,7 +822,7 @@ void loop() {
             updateVBATState();
             return;
         }
-        if (configPortalActive == true || motor_running || any_slave_moving() || slave_reading) {
+        if (configPortalActive == true || actuator.isMotorRunning() || any_slave_moving() || slave_reading) {
             // If config portal is active, don't go to sleep
             return;
         }
@@ -1157,6 +836,27 @@ void loop() {
     updateVBATState();
 }
 
+void ensureVBATOn() {
+  if (!vbat_state) {
+      vBAT(true);
+      vEXT(true); // Ensure logic shifter is on for RS485
+      delay(VBAT_BOOT_MS);
+  } else if (!vext_state) {
+      vEXT(true); // If vBAT is already on, still ensure vEXT is on
+  }
+}
+
+void setVBATKeepOn(unsigned long duration_ms) {
+  ensureVBATOn();
+  unsigned long new_until = millis() + duration_ms;
+  if (new_until > vbat_keep_on_until) vbat_keep_on_until = new_until;
+}
+
+void updateVBATState() {
+  if (!actuator.isMotorRunning() && !any_slave_moving() && !slave_reading && millis() > vbat_keep_on_until) {
+      vBAT(false);
+  } 
+}
 // function to enable the mosfet on the battery, normally used for reading battery voltage, but hacked to power the motor driver board with battery voltage not the regulated power.
 bool vBAT(bool state) {
   if (state && !vbat_state) {
@@ -1167,7 +867,7 @@ bool vBAT(bool state) {
     delay(10);
     return true;
   }
-  if (!state && vbat_state && !motor_running && !any_slave_moving() && !slave_reading) {  //make sure motor is not running before turning off
+  if (!state && vbat_state && !actuator.isMotorRunning() && !any_slave_moving() && !slave_reading) {  //make sure motor is not running before turning off
     digitalWrite(BATTERY_PIN, HIGH);
     vbat_state = false;
     LOG_INFO("vBAT Disabled\r\n");
@@ -1194,7 +894,7 @@ bool vEXT(bool vext_set_state) {
     digitalWrite(VEXT_PIN, LOW);
     vext_state = true;
     LOG_INFO("vEXT Enabled\r\n");
-    delay(250);
+    delay(500);
     return true;
   }
   if (!vext_set_state && vext_state) {
@@ -1204,149 +904,6 @@ bool vEXT(bool vext_set_state) {
     return false;
   }
   return vext_set_state;
-}
-
-void pollAndUpdatePosition() {
-    readPosition();
-}
-
-uint16_t readPosition(void) {
-  int posAvg = readPositionRaw();
-  cached_raw_position = posAvg;
-  long posCalc = map(posAvg, closed_raw, open_raw, 0, 1000);  // based on 390k and 100k voltage divider
-  uint16_t posConst = constrain(posCalc, 0, 1000);
-  cached_scaled_position = posConst;
-
-  LOG_INFO("Position update: Raw Pos=%u, Calc Pos=%u\r\n", cached_raw_position, cached_scaled_position);
-  return posConst;
-}
-
-int readPositionRaw(void) {
-    vEXT(true); // Ensure sensor power is on
-
-    int raw_wiper = analogReadMilliVolts(POSITION_PIN);      // Wiper voltage
-    int raw_ref   = analogReadMilliVolts(POSITION_REF_PIN);  // Reference voltage (top of pot)
-
-    // Prevent divide by zero or very low reference
-    if (raw_ref < 100) raw_ref = 100;
-
-    // Normalize wiper reading to 1.65V reference
-    int normalized = (raw_wiper * 1650) / raw_ref;
-
-    int posAvg = posEwma.filter(normalized);
-
-    LOG_INFO("Raw wiper: %d mV, Raw ref: %d mV, Normalized: %d mV\r\n", raw_wiper, raw_ref, normalized);
-
-    return posAvg;
-}
-
-// set a direction and a max/estimated runtime, motor stop may be called once position reached
-void run_motor(uint8_t dir, int runtime) {
-  ensureVBATOn();
-  if (dir == 0x01) {
-    if (closed_raw < open_raw) {
-        digitalWrite(IN_A_PIN, HIGH);
-        digitalWrite(IN_B_PIN, LOW);
-    } else {
-        digitalWrite(IN_A_PIN, LOW);
-        digitalWrite(IN_B_PIN, HIGH);
-    }
-    LOG_INFO(" Motor Started Retract\r\n");
-    if (motor_engaged) {
-      blind_state = STATE_CLOSING;
-    }
-    last_motor_dir = true;
-  }
-  if (dir == 0x02) {
-    if (closed_raw < open_raw) {
-        digitalWrite(IN_A_PIN, LOW);
-        digitalWrite(IN_B_PIN, HIGH); 
-    } else {
-        digitalWrite(IN_A_PIN, HIGH);
-        digitalWrite(IN_B_PIN, LOW);
-    }
-    LOG_INFO(" Motor Started Extend\r\n");
-    if (motor_engaged) {
-      blind_state = STATE_OPENING;
-    }
-    last_motor_dir = false;
-  }
-  digitalWrite(EN_PIN, HIGH);
-  motor_running = true;
-  motor_start_time = millis();
-  motor_run_time = runtime;
-  LOG_INFO(" Motor DIR %s\r\n", last_motor_dir ? "CW" : "CCW");
-  return;
-}
-
-void disengage_motor(void) {
-  last_motor_dir = !last_motor_dir;
-  LOG_INFO(" Motor Disengage\r\n");
-  motor_engaged = false;
-  run_motor(last_motor_dir ? 0x01 : 0x02, disengage_time);
-  return;
-}
-
-void update_motor(void) {
-  if (motor_running) {
-    last_move_status = MOVE_STATUS_MOVING;
-    uint16_t calcPos = readPosition();
-    const int tolerance = 5; // 0.5% of full range
-
-    bool achieved = false;
-    LOG_INFO("Motor update: calcPos=%u, targetPos=%u, last_motor_dir=%d, closed_raw=%u, open_raw=%u\r\n", calcPos, targetPos, last_motor_dir, closed_raw, open_raw);
-    if (last_motor_dir) { // closing
-      if (calcPos <= targetPos + tolerance) achieved = true;
-    } else { // opening
-      if (calcPos >= targetPos - tolerance) achieved = true;
-    }
-
-
-    if (motor_engaged && achieved) {
-      // target achieved
-      LOG_INFO(" position achieved\r\n");
-      LOG_INFO("Current Position: %.1f%% Target Position: %.1f%% Time taken to move: %lu\r\n", calcPos / 10.0f, targetPos / 10.0f, millis() - motor_start_time);
-      if (calcPos > 10) {
-        blind_state = STATE_OPEN;
-      } else {
-        blind_state = STATE_CLOSED;
-      }
-      last_move_status = MOVE_STATUS_OK;
-      prepareCommand(BLIND_STATUS, 0, blind_state, readPosition(), readPosition(), last_move_status);
-      setVBATKeepOn(disengage_time + 500); // Keep vBAT on for disengage period
-      disengage_motor();
-      return;
-    }
-    if (millis() - motor_start_time > motor_run_time) {
-      if (motor_engaged) {
-        LOG_WARN(" timeout before position achieved\r\n");
-        if (calcPos > 10) {
-          blind_state = STATE_OPEN;
-        } else {
-          blind_state = STATE_CLOSED;
-        }
-        last_move_status = MOVE_STATUS_TIMEOUT;
-        prepareCommand(BLIND_STATUS, 0, blind_state, readPosition(), readPosition(), last_move_status);
-        setVBATKeepOn(disengage_time + 500); // Keep vBAT on for disengage period
-        disengage_motor();
-        return;
-      }
-      //all done, stop motor
-      stop_motor();
-    }
-  }
-  updateVBATState();
-  return;
-}
-
-void stop_motor(void) {
-  digitalWrite(IN_A_PIN, LOW);
-  digitalWrite(IN_B_PIN, LOW);
-  digitalWrite(EN_PIN, LOW);
-  motor_running = false;
-  updateVBATState();
-  LOG_INFO("Motor Stopped\r\n");
-  return;
 }
 
 uint8_t checkOTP(uint8_t OTP[3]) {
@@ -1508,11 +1065,11 @@ void prepareCommand(uint8_t prep_command, uint8_t blind_number, uint8_t state, u
       if (blind_number != 0) {
         bool ok = sendCommandToSlaveUART(blind_number, BLIND_COMMAND, command.payload, sizeof(command.payload));
         LOG_INFO("Sent BLIND_COMMAND to slave %u via UART: %s\r\n", blind_number, ok ? "OK" : "FAIL");
-        setVBATKeepOn(stroke_time + 5000);
+        setVBATKeepOn(8000);
         break;
       }
       memcpy(&blind_command, command.payload, sizeof(command.payload));
-      posCalc = readPosition();
+      posCalc = actuator.readPositionPercent();
       switch (blind_command.set_state) {
         case 0x00:
           targetPos = 0;
@@ -1522,7 +1079,7 @@ void prepareCommand(uint8_t prep_command, uint8_t blind_number, uint8_t state, u
           break;
         case 0x03:
           targetPos = posCalc;
-          stop_motor();
+          actuator.abortMove();
           break;
         case 0x04:
           targetPos = constrain(blind_command.set_position, 0, 100) * 10;
@@ -1530,26 +1087,12 @@ void prepareCommand(uint8_t prep_command, uint8_t blind_number, uint8_t state, u
         default:
           LOG_WARN("ooops.. something messed up\r\n");
       }
-      LOG_INFO("Target Position: %.1f%% Current Position: %.1f%% Time to position: %d ms\r\n", targetPos / 10.0f, posCalc / 10.0f, disengage_time + (abs(targetPos - posCalc) * stroke_time / 1000) + 5000);
-      if (abs(targetPos - posCalc) > 10) {
-        motor_engaged = true;
-        run_motor((targetPos < posCalc) ? 0x01 : 0x02, disengage_time + (abs(targetPos - posCalc) * stroke_time / 1000) + 5000);
-      } else {
-        LOG_INFO("Already at position\r\n");
-      }
+      LOG_INFO("Target Position: %.1f%% Current Position: %.1f%% \r\n", targetPos / 10.0f, posCalc / 10.0f);
+        actuator.commandMove(targetPos);
       break;
     case SET_PARAMETER:
       LOG_INFO("SET PARAMETER\r\n");
       memcpy(&blind_parameters, command.payload, sizeof(command.payload));
-      /*
-      	uint8_t blindNumber;
-	uint8_t openSpeed;  //dutycycle
-	uint8_t closeSpeed;
-  uint8_t pwmFrequency; //frequency / 10, gives upto 25.5kHz in 100hz steps. 
-  uint8_t openTime; // in seconds, gives upto 4min 15seconds open time.
-  uint8_t closeTime;
-  uint16_t disengageTime; //in ms / 10, gives 0 to 10.2seconds range
-  */
       
       break;
     case GET_PARAMETER:
@@ -1578,8 +1121,6 @@ void prepareCommand(uint8_t prep_command, uint8_t blind_number, uint8_t state, u
   return;
 }
 
-
-// switch case based on
 void actionCommand(void) {
   LOG_INFO(" Actioning command Now.. \r\n");
   // Declare all variables at the top to avoid jump to case label errors
@@ -1616,11 +1157,13 @@ void actionCommand(void) {
         slave_moving[blind_number] = true;
         bool ok = sendCommandToSlaveUART(blind_number, BLIND_COMMAND, command.payload, sizeof(command.payload));
         LOG_INFO("Sent BLIND_COMMAND to slave %u via UART: %s\r\n", blind_number, ok ? "OK" : "FAIL");
-        setVBATKeepOn(stroke_time + 5000);
+        setVBATKeepOn(8000);
         break;
       }
       memcpy(&blind_command, command.payload, sizeof(command.payload));
-      calcPos = readPosition();
+      ensureVBATOn();
+      setVBATKeepOn(8000);
+      calcPos = actuator.readPositionPercent();
       switch (blind_command.set_state) {
         case 0x00:
           targetPos = 0;
@@ -1630,7 +1173,7 @@ void actionCommand(void) {
           break;
         case 0x03:
           targetPos = calcPos;
-          stop_motor();
+          actuator.abortMove();
           break;
         case 0x04:
           targetPos = constrain(blind_command.set_position, 0, 100) * 10;
@@ -1638,26 +1181,12 @@ void actionCommand(void) {
         default:
           LOG_WARN("ooops.. something messed up\r\n");
       }
-      LOG_INFO("Target Position: %.1f%% Current Position: %.1f%% Time to position: %d ms\r\n", targetPos / 10.0f, calcPos / 10.0f, disengage_time + (abs(targetPos - calcPos) * stroke_time / 1000) + 5000);
-      if (abs(targetPos - calcPos) > 10) {
-        motor_engaged = true;
-        run_motor((targetPos < calcPos) ? 0x01 : 0x02, disengage_time + (abs(targetPos - calcPos) * stroke_time / 1000) + 5000);
-      } else {
-        LOG_INFO("Already at position\r\n");
-      }
+      LOG_INFO("Target Position: %.1f%% Current Position: %.1f%% \r\n", targetPos / 10.0f, calcPos / 10.0f);
+        actuator.commandMove(targetPos);
       break;
     case SET_PARAMETER:
       LOG_INFO("SET PARAMETER\r\n");
       memcpy(&blind_parameters, command.payload, sizeof(command.payload));
-      /*
-      	uint8_t blindNumber;
-	uint8_t openSpeed;  //dutycycle
-	uint8_t closeSpeed;
-  uint8_t pwmFrequency; //frequency / 10, gives upto 25.5kHz in 100hz steps. 
-  uint8_t openTime; // in seconds, gives upto 4min 15seconds open time.
-  uint8_t closeTime;
-  uint16_t disengageTime; //in ms / 10, gives 0 to 10.2seconds range
-  */
       
       break;
     case GET_PARAMETER:
@@ -1678,7 +1207,9 @@ void actionCommand(void) {
         setVBATKeepOn(5 * 60 * 1000);
         break;
       } else {
-        startConfigAPAndWebserver(); // Your function to start the web portal
+        setVBATKeepOn(600000);
+        startConfigAPAndWebserver(actuator); // Pass actuator to ensure web portal endpoints are registered
+        //actuator.startCalibrationSequence(); // TEMP: Trigger calibration when web portal starts
       }
       configPortalActive = true;
       configPortalStartTime = millis();
@@ -1713,9 +1244,6 @@ void parsePacket(void) {
   memcpy(encrypted, loraRXbuffer.first().dataEncrypted, sizeof(encrypted));
   aes128.decryptBlock(decrypted, encrypted);
   memcpy(&dataDEC, decrypted, sizeof(decrypted));
-
-  //temp disable decryption
-  //memcpy(&dataDEC, &loraRXpacket.dataEncrypted, sizeof(loraRXpacket.dataEncrypted));
 
   //verify OTP is correct
   uint8_t OTPresult = checkOTP(dataDEC.OTP);
@@ -1919,6 +1447,7 @@ void goToSleep(void) {
   LOG_INFO("Going to sleep...\r\n");
   vEXT(false); // Turn off logic shifter
   // Start waiting for data package
+  actuator.prepareForDeepSleep();
   Radio.Standby();
   SX126xSetDioIrqParams(IRQ_RX_DONE | IRQ_RX_TX_TIMEOUT, IRQ_RX_DONE | IRQ_RX_TX_TIMEOUT, IRQ_RADIO_NONE, IRQ_RADIO_NONE);
 
@@ -2076,3 +1605,6 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
         LOG_INFO("NO_MEAN\r\n");
     }
   }
+
+
+
