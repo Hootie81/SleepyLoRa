@@ -17,6 +17,8 @@ Key design requirement was for the blinds to still operate by hand, so a mechani
 
 Position is sensed using a linear potentiometer thats connected to the actualing arm, so the blinds always know their position.
 
+The actuators now use a PID controller to target a specified time for each move, this allows the motor to run significantly quieter and allows syncronsation of blinds with different operating forces/friction. All PID, PWM and timing settings are customisable.
+
 All data packets are AES128 encrypted and hardened against replay attacks using 1 second interval TOTP, so no-one can open your blinds but you.
 Costs are kept low by using cheap modules form china, assembled onto custom PCB's and housed in 3d printed parts.
 The wired slaves are powered by the master, thus only a single battery and solar panel per system and a significant reduction in actuator cost too. 
@@ -62,6 +64,9 @@ Your support helps me keep building and maintaining open-source projects like th
 - **Home Assistant auto-discovery**
 - **OTA firmware updates**
 - **Configurable RS485 slave addressing**
+- **Easy Open/Closed position setting via web portal**
+- **PWM speed control with PID controller for quiet operation**
+- **Auto calibration feature for disengage mechanism**
 - **Low-power operation** 
 - **3D-printable hardware** 
 - **Easy to assemble electronics**
@@ -110,23 +115,29 @@ Your support helps me keep building and maintaining open-source projects like th
 - Configure the Master/s
   - Connect to the SleeplyLoRaMaster AP (pw: blind1234)
   - Load the keys file downloaded above
+  - Set Open and Closed limits
   - Save and reboot
   - Master sync's time with gateway
-  - Master publishes Device matric discovery info - battery, diagnostic data etc every 60sec.
-  - Master publishes Blind discovery info, and publishes data every 60sec.
+  - Master transmits Device metrics and status to Gateway.
+  - Gateway publishes Blind discovery info, subscribes to MQTT topics, and publishes data every 60sec.
+  - Master will transmit device metrics and status every minute.
 - Check your HA MQTT integration, the Gatway, device and blind will magically appear after a minute or so. 
 - Optionally - configure the slave/save
   - Connect the slave to the master 
   - Press the reset button on the master
   - Master will scan for slaves on initial bootup
-  - Master publishes the newly found slave.
+  - Master transmits slave status to Gateway.
+  - Gateway publishes Blind discovery info, subscribes to MQTT topics, and publishes data every 60sec.
+  - Open web portal via MQTT or from the master web portal
+  - Set Open and Closed limits
+  - Master will poll slave and transmit status every minute.
   - Optionally - if a second slave is required
     - press the "Open Web Portal" button on the slave device in HomeAssistant
 	- Connect to the SleeplyLoRaSlave AP (pw: blind1234)
 	- Change the slave number
 	- Save to flash
-    - Press the reset button on the master
-    - Master will scan for slaves
+    - Scan for slaves via the master's web portal (Or press the reset button on the master)
+    - Master will rescan for slaves
 
 ---
 
@@ -139,9 +150,10 @@ Your support helps me keep building and maintaining open-source projects like th
 
 ## ToDo
 
-- Impliment the commands for setting actuator limits
-- Impliment PWM control of motors to reduce noise
-- Self calibration features to determine stroke time and disengage time
+- Update slave firmware to use new motor controller library and updated web portal.
+- Add feature to get/set all blind settings via MQTT.
+- Design an enclosure to the battery and charger modules.
+- Make an injection moulding option for the plastic parts.
 
 ---
 
