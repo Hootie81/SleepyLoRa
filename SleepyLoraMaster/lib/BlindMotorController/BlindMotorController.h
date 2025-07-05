@@ -132,9 +132,9 @@ public:
     uint8_t getPwmMax() const { return pwmMax; }
     // Set/get PWM frequency
     void setPwmFrequency(uint32_t freq) {
-        // DRV8833: recommended 100Hz to 20kHz
+        // DRV8833: recommended 100Hz to 20kHz, but allow up to 40kHz for experimentation
         if (freq < 100) freq = 100;
-        if (freq > 20000) freq = 20000;
+        if (freq > 40000) freq = 40000;
         pwmFrequency = freq;
         ledcSetup(pwmChannel, pwmFrequency, 8); // Immediately apply new frequency
         saveAllSettings();
