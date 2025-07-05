@@ -32,13 +32,56 @@ void onLoadFileUpload(AsyncWebServerRequest *request, String filename, size_t in
 
 extern bool hexToBytes(const char*, uint8_t*, size_t);
 
+// WiFi config variables
+String wifi_ssid = "";
+String wifi_pass = "";
+bool wifi_enable = false;
+String wifi_status = "WiFi not configured.";
+
+// Helper to load/save WiFi config from NVM
+void loadWiFiConfig() {
+  prefs.begin("loracfg", true);
+  wifi_ssid = prefs.getString("wifi_ssid", "");
+  wifi_pass = prefs.getString("wifi_pass", "");
+  wifi_enable = prefs.getBool("wifi_enable", false);
+  prefs.end();
+}
+void saveWiFiConfig() {
+  prefs.begin("loracfg", false);
+  prefs.putString("wifi_ssid", wifi_ssid);
+  prefs.putString("wifi_pass", wifi_pass);
+  prefs.putBool("wifi_enable", wifi_enable);
+  prefs.end();
+}
+
 void startConfigAPAndWebserver(BlindMotorController& blind) {
   Serial.println("[DEBUG] Starting Config AP and Webserver...");
-  WiFi.mode(WIFI_AP);
-  bool apResult = WiFi.softAP("SleepyLoRaMaster", "blind1234");
-  Serial.printf("[DEBUG] softAP result: %s\n", apResult ? "success" : "fail");
-  Serial.print("[DEBUG] AP IP: ");
-  Serial.println(WiFi.softAPIP());
+  loadWiFiConfig();
+  if (wifi_enable && wifi_ssid.length() > 0) {
+    WiFi.mode(WIFI_STA);
+    // Use deviceID from main.cpp for consistent naming
+    extern uint32_t deviceID;
+    char hostname[32];
+    snprintf(hostname, sizeof(hostname), "SleepyLoRaMaster_%08lX", (unsigned long)deviceID);
+    WiFi.setHostname(hostname); // Set before WiFi.begin
+    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+    unsigned long startAttempt = millis();
+    wifi_status = "Connecting to WiFi...";
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 8000) {
+      delay(200);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      wifi_status = String("Connected: ") + WiFi.localIP().toString();
+    } else {
+      wifi_status = "WiFi connection failed. Starting AP mode.";
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP("SleepyLoRaMaster", "blind1234");
+    }
+  } else {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("SleepyLoRaMaster", "blind1234");
+    wifi_status = String("AP IP: ") + WiFi.softAPIP().toString();
+  }
   setupWebPortal(server, blind);
   server.begin();
   Serial.println("[DEBUG] Webserver started on port 80");
@@ -47,6 +90,7 @@ void startConfigAPAndWebserver(BlindMotorController& blind) {
 void stopConfigAPAndWebserver() {
   Serial.println("[DEBUG] Stopping Webserver and AP...");
   server.end();
+  WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   configMode = false;
   Serial.println("[DEBUG] Webserver stopped, WiFi off, configMode=false");
@@ -172,6 +216,10 @@ String renderTemplate(const char* tpl) {
     html.replace("{{SLAVE_LIST}}", renderSlaveList());
     html.replace("{{ENGAGE_SAMPLES}}", String(blindPtr ? blindPtr->getEngageSampleCount() : 0));
     html.replace("{{ENGAGE_SAMPLE_COUNT}}", String(blindPtr ? blindPtr->getEngageSampleCount() : 0));
+    html.replace("{{WIFI_SSID}}", wifi_ssid);
+    html.replace("{{WIFI_PASS}}", wifi_pass);
+    html.replace("{{WIFI_ENABLE}}", wifi_enable ? "checked" : "");
+    html.replace("{{WIFI_STATUS}}", wifi_status);
     return html;
 }
 
@@ -618,5 +666,12 @@ pre.ascii-art { text-align: center; font-size: 1.1em; margin-bottom: 18px; color
         // Insert ASCII art and replace any template variables
         helpHtml.replace("{{ASCII_ART}}", String(BLIND_ASCII_ART));
         request->send(200, "text/html", helpHtml);
+    });
+    server.on("/set_wifi", HTTP_POST, [](AsyncWebServerRequest *request){
+        wifi_ssid = request->getParam("wifi_ssid", true)->value();
+        wifi_pass = request->getParam("wifi_pass", true)->value();
+        wifi_enable = request->hasParam("wifi_enable", true);
+        saveWiFiConfig();
+        request->redirect("/");
     });
 }

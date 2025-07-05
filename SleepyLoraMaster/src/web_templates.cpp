@@ -165,6 +165,18 @@ Status: <span id='blindstatus'>{{BLIND_STATUS}}</span> | Calibration: <span id='
         <div style="font-size:0.95em; color:#666;">You can set keys and gateway manually above, or load them from a JSON file exported from another device.</div>
       </div>
     </div>
+    <div class="advanced-section" style="margin-top:18px;">
+      <div class="adv-toggle" onclick="toggleWiFi()">WiFi Settings &#9660;</div>
+      <div id="wifi-section" style="display:none; padding-left:10px;">
+        <form method='POST' action='/set_wifi' style='margin-bottom:10px;'>
+          <div class="form-row"><label for='wifi_ssid'>SSID:</label><input type='text' name='wifi_ssid' id='wifi_ssid' value='{{WIFI_SSID}}' maxlength='32' style='width:180px;'></div>
+          <div class="form-row"><label for='wifi_pass'>Password:</label><input type='password' name='wifi_pass' id='wifi_pass' value='{{WIFI_PASS}}' maxlength='64' style='width:180px;'></div>
+          <div class="form-row"><input type='checkbox' name='wifi_enable' id='wifi_enable' {{WIFI_ENABLE}}> <label for='wifi_enable'>Connect to WiFi (otherwise AP mode)</label></div>
+          <button type='submit' style='margin-left:12px;'>Save WiFi Settings</button>
+        </form>
+        <div id="wifi-status" style="font-size:0.95em; color:#666;">{{WIFI_STATUS}}</div>
+      </div>
+    </div>
   </div>
   <div id="slider-container">
     <input type="range" min="0" max="100" value="{{BLIND_POS}}" class="vertical-slider" id="blindSlider" orient="vertical">
@@ -277,6 +289,18 @@ function toggleSlaves() {
   } else {
     slaves.style.display = 'none';
     toggle.innerHTML = 'Slave Devices &#9660;'; // ▼
+  }
+}
+
+function toggleWiFi() {
+  var wifi = document.getElementById('wifi-section');
+  var toggle = document.querySelector('.adv-toggle[onclick="toggleWiFi()"]');
+  if (wifi.style.display === 'none' || wifi.style.display === '') {
+    wifi.style.display = 'block';
+    toggle.innerHTML = 'WiFi Settings &#9650;'; // ▲
+  } else {
+    wifi.style.display = 'none';
+    toggle.innerHTML = 'WiFi Settings &#9660;'; // ▼
   }
 }
 
@@ -424,7 +448,8 @@ window.addEventListener('DOMContentLoaded', function() {
     { id: 'pwm-settings', toggle: 'togglePWM' },
     { id: 'slaves-section', toggle: 'toggleSlaves' },
     { id: 'ota-section', toggle: 'toggleOTA' },
-    { id: 'keys-section', toggle: 'toggleKeys' }
+    { id: 'keys-section', toggle: 'toggleKeys' },
+    { id: 'wifi-section', toggle: 'toggleWiFi' }
   ];
   sections.forEach(function(section) {
     var elem = document.getElementById(section.id);
