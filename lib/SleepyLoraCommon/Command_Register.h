@@ -17,6 +17,8 @@
 #define UPDATE_FIRMWARE 0x08
 #define UPDATE_SLAVE    0x09  // Used for web portal/OTA on slave
 
+#define BASE_ADDR 0x20 // base address for slaves
+
 enum coverState{
   STATE_CLOSING=0x01,
   STATE_OPENING=0x02,

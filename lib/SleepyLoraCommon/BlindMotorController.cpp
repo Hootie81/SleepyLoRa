@@ -501,8 +501,9 @@ uint16_t BlindMotorController::readADC(uint8_t pin) {
     // Ratiometric: (position / vref) * 4095
     uint32_t pos = analogRead(pin);
     uint32_t vref = analogRead(vrefPin);
-    if (vref == 0){
-        vref = 1;
+    //Serial.printf("pos %u   vref %u\r\n", pos, vref);
+    if (vref <= 2000){
+        vref = 2400;
         //Serial.printf("[BlindMotor]vref error\n");
     }
     return (uint16_t)((pos * 4095UL) / vref);

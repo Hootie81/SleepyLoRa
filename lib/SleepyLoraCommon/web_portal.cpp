@@ -5,7 +5,7 @@
 #include <Update.h>
 #include <ESPAsyncWebServer.h>
 #include "Command_Register.h" // <-- Add this include for command macros
-
+#define DEVICE_ROLE_SLAVE 1
 // Extern config variables from main.cpp
 extern uint32_t config_gatewayID;
 extern uint8_t config_aes_key[16];
@@ -14,6 +14,9 @@ extern uint32_t config_rf_frequency;
 extern void saveConfigToFlash();
 extern bool configMode;
 extern bool configPortalActive;
+extern uint8_t slave_number;
+extern uint8_t rs485_addr;
+bool isAddressInUse(uint8_t candidate_addr);
 
 // Externs for slave/command functions/constants from main.cpp
 extern void scanUARTSlavesAndPublish();
@@ -40,14 +43,14 @@ String wifi_status = "WiFi not configured.";
 
 // Helper to load/save WiFi config from NVM
 void loadWiFiConfig() {
-  prefs.begin("loracfg", true);
+  prefs.begin("wificfg", true);
   wifi_ssid = prefs.getString("wifi_ssid", "");
   wifi_pass = prefs.getString("wifi_pass", "");
   wifi_enable = prefs.getBool("wifi_enable", false);
   prefs.end();
 }
 void saveWiFiConfig() {
-  prefs.begin("loracfg", false);
+  prefs.begin("wificfg", false);
   prefs.putString("wifi_ssid", wifi_ssid);
   prefs.putString("wifi_pass", wifi_pass);
   prefs.putBool("wifi_enable", wifi_enable);
@@ -62,7 +65,11 @@ void startConfigAPAndWebserver(BlindMotorController& blind) {
     // Use deviceID from main.cpp for consistent naming
     extern uint32_t deviceID;
     char hostname[32];
+    #ifdef DEVICE_ROLE_MASTER
     snprintf(hostname, sizeof(hostname), "SleepyLoRaMaster_%08lX", (unsigned long)deviceID);
+    #else
+    snprintf(hostname, sizeof(hostname), "SleepyLoRaSlave");
+    #endif
     WiFi.setHostname(hostname); // Set before WiFi.begin
     WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
     unsigned long startAttempt = millis();
@@ -71,15 +78,24 @@ void startConfigAPAndWebserver(BlindMotorController& blind) {
       delay(200);
     }
     if (WiFi.status() == WL_CONNECTED) {
-      wifi_status = String("Connected: ") + WiFi.localIP().toString();
+        wifi_status = String("Connected: ") + WiFi.localIP().toString();
     } else {
-      wifi_status = "WiFi connection failed. Starting AP mode.";
-      WiFi.mode(WIFI_AP);
-      WiFi.softAP("SleepyLoRaMaster", "blind1234");
+        wifi_status = "WiFi connection failed. Starting AP mode.";
+        WiFi.mode(WIFI_AP);
+
+        #ifdef DEVICE_ROLE_MASTER
+        WiFi.softAP("SleepyLoRaMaster", "blind1234");
+        #else
+        WiFi.softAP("SleepyLoRaSlave", "blind1234");
+        #endif
     }
   } else {
     WiFi.mode(WIFI_AP);
+    #ifdef DEVICE_ROLE_MASTER
     WiFi.softAP("SleepyLoRaMaster", "blind1234");
+    #else
+    WiFi.softAP("SleepyLoRaSlave", "blind1234");
+    #endif
     wifi_status = String("AP IP: ") + WiFi.softAPIP().toString();
   }
   setupWebPortal(server, blind);
@@ -107,45 +123,6 @@ const char* BLIND_ASCII_ART =
 static BlindMotorController* blindPtr = nullptr;
 static int wsClientCount = 0;
 
-String processor(const String& var) {
-    Serial.print("[DEBUG] processor called for var: ");
-    Serial.println(var);
-    if (var == "ASCII_ART") return String(BLIND_ASCII_ART);
-    if (!blindPtr) {
-        Serial.println("[DEBUG] blindPtr is null!");
-        return String();
-    }
-    if (var == "RAW_POS") return String(blindPtr->readPositionRaw());
-    if (var == "BLIND_POS") return String(blindPtr->readPositionPercent());
-    if (var == "ENGAGE_PWM") return String(blindPtr->getEngagePwm());
-    if (var == "DISENGAGE_PWM") return String(blindPtr->getDisengagePwm());
-    if (var == "PWM_MIN") return String(blindPtr->getPwmMin());
-    if (var == "PWM_MAX") return String(blindPtr->getPwmMax());
-    if (var == "MOVE_TIME") return String(blindPtr->getMoveTimeMs());
-    if (var == "ENGAGE_TIME") return String(blindPtr->getEngageTime());
-    if (var == "DISENGAGE_TIME") return String(blindPtr->getDisengageTime());
-    if (var == "CLOSED_LIMIT") return String(blindPtr->getClosedLimit());
-    if (var == "OPEN_LIMIT") return String(blindPtr->getOpenLimit());
-    if (var == "GATEWAY_ID") {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%08lx", (unsigned long)config_gatewayID); // HEX, zero-padded
-        return String(buf);
-    }
-    if (var == "AES_KEY") {
-        char aesKeyHex[33] = {0};
-        for (int i = 0; i < 16; ++i) sprintf(&aesKeyHex[i*2], "%02X", config_aes_key[i]);
-        return String(aesKeyHex);
-    }
-    if (var == "HMAC_KEY") {
-        char hmacKeyHex[21] = {0};
-        for (int i = 0; i < 10; ++i) sprintf(&hmacKeyHex[i*2], "%02X", config_hmacKey[i]);
-        return String(hmacKeyHex);
-    }
-    // Add more as needed for keys, gateway, etc.
-    Serial.println("[DEBUG] processor: unknown var");
-    return String();
-}
-
 AsyncWebSocket ws("/ws");
 
 static void notifyAllClients() {
@@ -155,7 +132,7 @@ static void notifyAllClients() {
     doc["rawPos"] = blindPtr->readPositionRaw();
     doc["status"] = blindPtr->getStatusString();
     doc["calib"] = blindPtr->getCalibrationStateString();
-
+#ifdef DEVICE_ROLE_MASTER
     // --- Add slave positions ---
     extern uint8_t detected_slaves[];
     extern uint8_t detected_slave_count;
@@ -167,13 +144,12 @@ static void notifyAllClients() {
         s["id"] = blind_number;
         s["pos"] = slave_positions ? (slave_positions[blind_number] / 10) : 0; // scale 0-1000 to 0-100
     }
-
+#endif
     String msg;
     serializeJson(doc, msg);
     ws.textAll(msg);
 }
 
-// Manual template rendering for ESP32 (since processor is not called)
 String renderTemplate(const char* tpl) {
     String html(tpl);
     html.replace("{{ASCII_ART}}", BLIND_ASCII_ART);
@@ -259,6 +235,7 @@ String renderSlaveList() {
     return out;
 }
 
+
 // Upload handler for /loadfile
 static String uploadedConfigFile;
 // New upload handler for /loadfile
@@ -317,11 +294,10 @@ void setupWebPortal(AsyncWebServer& server, BlindMotorController& blind) {
     blindPtr = &blind;
     Serial.printf("[DEBUG] blindPtr address after assignment: %p\n", (void*)blindPtr);
     Serial.println("[DEBUG] Registering main page handler with manual template rendering...");
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-        Serial.println("[DEBUG] / handler called");
-        Serial.printf("[DEBUG] MAIN_PAGE_TEMPLATE address: %p\n", (const void*)MAIN_PAGE_TEMPLATE);
-        Serial.println("[DEBUG] About to call renderTemplate...");
-        String html = renderTemplate(MAIN_PAGE_TEMPLATE);
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){       
+        String html = renderTemplate(MAIN_PAGE_TEMPLATE_1);
+        html += renderTemplate(DEVICE_SPECIFIC_PAGE_TEMPLATE);
+        html += renderTemplate(MAIN_PAGE_TEMPLATE_2);
         request->send(200, "text/html", html);
         Serial.println("[DEBUG] send call returned");
     });
@@ -439,6 +415,31 @@ void setupWebPortal(AsyncWebServer& server, BlindMotorController& blind) {
             }
         }
     });
+    #ifdef DEVICE_ROLE_SLAVE
+    server.on("/set_slave_number", HTTP_POST, [](AsyncWebServerRequest *request){
+        if (request->hasParam("slave_number", true)) {
+            uint8_t new_slave_number = request->getParam("slave_number", true)->value().toInt();
+            if (new_slave_number < 1 || new_slave_number > 12) {
+                request->send(400, "text/html", "<html><body>Invalid slave number!<br><a href='/'>Back</a></body></html>");
+                return;
+            }
+            uint8_t candidate_addr = BASE_ADDR + (new_slave_number - 1);
+            if (isAddressInUse(candidate_addr)) {
+                request->send(400, "text/html", "<html><body>Address already in use by another device!<br><a href='/'>Back</a></body></html>");
+                return;
+            }
+            slave_number = new_slave_number;
+            rs485_addr = candidate_addr;
+            // Save to flash
+            prefs.begin("slavecfg", false);
+            prefs.putUChar("slave_number", slave_number);
+            prefs.end();
+            request->send(200, "text/html", "<html><body>Slave number saved!<br><a href='/'>Back</a></body></html>");
+        } else {
+            request->send(400, "text/html", "<html><body>Missing slave number.<br><a href='/'>Back</a></body></html>");
+        }
+    });
+    #endif
     server.on("/loadfile", HTTP_POST, [](AsyncWebServerRequest *request) {
         // This will be called after upload is complete if no upload handler is set, so just do nothing here
     }, onLoadFileUpload);
@@ -495,6 +496,7 @@ void setupWebPortal(AsyncWebServer& server, BlindMotorController& blind) {
         }
         request->redirect("/");
     });
+    #ifdef DEVICE_ROLE_MASTER
     server.on("/scan_slaves", HTTP_POST, [](AsyncWebServerRequest *request){
         scanUARTSlavesAndPublish();
         request->redirect("/");
@@ -526,6 +528,7 @@ void setupWebPortal(AsyncWebServer& server, BlindMotorController& blind) {
         }
         request->redirect("/");
     });
+    #endif
     server.on("/set_all_pwm", HTTP_POST, [](AsyncWebServerRequest *request){
         uint8_t minVal = blindPtr->getPwmMin();
         uint8_t maxVal = blindPtr->getPwmMax();
