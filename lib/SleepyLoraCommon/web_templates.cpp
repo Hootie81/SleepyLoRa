@@ -1,7 +1,7 @@
 #include "web_templates.h"
 
 // Full template for main UI
-const char MAIN_PAGE_TEMPLATE[] = R"rawliteral(
+const char MAIN_PAGE_TEMPLATE_1[] = R"rawliteral(
 <html>
 <head>
 <style>
@@ -125,6 +125,9 @@ Status: <span id='blindstatus'>{{BLIND_STATUS}}</span> | Calibration: <span id='
         </div>
       </div>
     </div>
+)rawliteral";
+#ifdef DEVICE_ROLE_MASTER
+const char DEVICE_SPECIFIC_PAGE_TEMPLATE[] = R"rawliteral(
     <!-- Slave Devices Section -->
     <div class="advanced-section" style="margin-top:18px;">
       <div class="adv-toggle" onclick="toggleSlaves()">Slave Devices &#9660;</div>
@@ -138,17 +141,6 @@ Status: <span id='blindstatus'>{{BLIND_STATUS}}</span> | Calibration: <span id='
       </div>
     </div>
     <!-- End Slave Devices Section -->
-    <!-- OTA and Keys moved out of Advanced -->
-    <div class="advanced-section" style="margin-top:18px;">
-      <div class="adv-toggle" onclick="toggleOTA()">Firmware Update (OTA) &#9660;</div>
-      <div id="ota-section" style="display:none; padding-left:10px;">
-        <form method='POST' action='/update' enctype='multipart/form-data' style='margin-bottom:10px;'>
-          <input type='file' name='update'>
-          <button type='submit'>Update Firmware</button>
-        </form>
-        <div style="font-size:0.95em; color:#666; margin-bottom:8px;">Upload a .bin file to update device firmware.</div>
-      </div>
-    </div>
     <div class="advanced-section" style="margin-top:18px;">
       <div class="adv-toggle" onclick="toggleKeys()">Device Keys & Gateway Configuration &#9660;</div>
       <div id="keys-section" style="display:none; padding-left:10px;">
@@ -165,6 +157,48 @@ Status: <span id='blindstatus'>{{BLIND_STATUS}}</span> | Calibration: <span id='
         <div style="font-size:0.95em; color:#666;">You can set keys and gateway manually above, or load them from a JSON file exported from another device.</div>
       </div>
     </div>
+)rawliteral";
+#else
+const char DEVICE_SPECIFIC_PAGE_TEMPLATE[] = R"rawliteral(
+    <!-- Slave Device Section -->
+    <div class="advanced-section" style="margin-top:18px;">
+      <div class="adv-toggle" onclick="toggleSlaveNumber()">Slave Number &#9660;</div>
+      <div id="slave-number-section" style="display:none; padding-left:10px;">
+        <form method="POST" action="/set_slave_number" style="margin-bottom:10px;">
+          <label for="slave_number" style="font-weight:bold;">Slave Number:</label><br>
+          <select name="slave_number" id="slave_number" style="width:100%;padding:6px;margin-bottom:10px;">
+            <option value="1" {{SLAVE_NUM_1}}>1</option>
+            <option value="2" {{SLAVE_NUM_2}}>2</option>
+            <option value="3" {{SLAVE_NUM_3}}>3</option>
+            <option value="4" {{SLAVE_NUM_4}}>4</option>
+            <option value="5" {{SLAVE_NUM_5}}>5</option>
+            <option value="6" {{SLAVE_NUM_6}}>6</option>
+            <option value="7" {{SLAVE_NUM_7}}>7</option>
+            <option value="8" {{SLAVE_NUM_8}}>8</option>
+            <option value="9" {{SLAVE_NUM_9}}>9</option>
+            <option value="10" {{SLAVE_NUM_10}}>10</option>
+            <option value="11" {{SLAVE_NUM_11}}>11</option>
+            <option value="12" {{SLAVE_NUM_12}}>12</option>
+          </select><br>
+          <button type='submit'>Save</button>
+        </form>
+      </div>
+    </div>
+)rawliteral";
+#endif
+const char MAIN_PAGE_TEMPLATE_2[] = R"rawliteral(
+    <!-- OTA and Keys Section -->
+    <div class="advanced-section" style="margin-top:18px;">
+      <div class="adv-toggle" onclick="toggleOTA()">Firmware Update (OTA) &#9660;</div>
+      <div id="ota-section" style="display:none; padding-left:10px;">
+        <form method='POST' action='/update' enctype='multipart/form-data' style='margin-bottom:10px;'>
+          <input type='file' name='update'>
+          <button type='submit'>Update Firmware</button>
+        </form>
+        <div style="font-size:0.95em; color:#666; margin-bottom:8px;">Upload a .bin file to update device firmware.</div>
+      </div>
+    </div>
+
     <div class="advanced-section" style="margin-top:18px;">
       <div class="adv-toggle" onclick="toggleWiFi()">WiFi Settings &#9660;</div>
       <div id="wifi-section" style="display:none; padding-left:10px;">
@@ -265,6 +299,18 @@ function toggleOTA() {
   } else {
     ota.style.display = 'none';
     toggle.innerHTML = 'Firmware Update (OTA) &#9660;'; // ▼
+  }
+}
+
+function toggleSlaveNumber() {
+  var section = document.getElementById('slave-number-section');
+  var toggle = document.querySelector('.adv-toggle[onclick="toggleSlaveNumber()"]');
+  if (section.style.display === 'none' || section.style.display === '') {
+    section.style.display = 'block';
+    toggle.innerHTML = 'Slave Number &#9650;';
+  } else {
+    section.style.display = 'none';
+    toggle.innerHTML = 'Slave Number &#9660;';
   }
 }
 
