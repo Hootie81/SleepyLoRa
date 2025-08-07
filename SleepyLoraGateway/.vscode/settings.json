@@ -1,0 +1,10 @@
+{
+  "files.watcherExclude": {
+    "**/.pio": true,
+    "**/.vscode": true
+  },
+  "search.exclude": {
+    "**/.pio": true,
+    "**/.vscode": true
+  }
+}

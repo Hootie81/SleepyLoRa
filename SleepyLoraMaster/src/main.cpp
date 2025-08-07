@@ -99,6 +99,11 @@
 #define UART_END_BYTE   0x55
 #define UART_BAUDRATE   115200
 
+// dummy values for common library
+uint8_t slave_number = 0;
+uint8_t rs485_addr = 0;
+bool isAddressInUse(unsigned char) { return false; }
+
 #define GET_STATUS 0x08
 #define UPDATE_SLAVE 0x09
 #define UART_TIMEOUT_MS 90
@@ -1139,17 +1144,30 @@ void actionCommand(void) {
       performTimeSync();
       break;
     case DEVICE_STATUS:
-      battVRX += (uint16_t)command.payload[0] << 8;
-      battVRX += (uint16_t)command.payload[1];   
-      wakeCountRX += (uint16_t)command.payload[2] << 8;
-      wakeCountRX += (uint16_t)command.payload[3]; 
-      awakeTimeRX += (uint16_t)command.payload[4] << 8;
-      awakeTimeRX += (uint16_t)command.payload[5];     
-      LOG_INFO("Command: DEVICE STATUS   Battery Voltage: %umV   Wakeup Count: %u   Total Awake Time: %u\r\n", battVRX, wakeCountRX, awakeTimeRX);
+      prepareCommand(DEVICE_STATUS);
       break;
-    case BLIND_STATUS:
-      LOG_INFO("BLIND STATUS\r\n");
+    case BLIND_STATUS: {
+      LOG_INFO("BLIND STATUS poll received\r\n");
+      uint8_t requested_blind = command.payload[0];
+      if (requested_blind == 0) {
+        // Master blind: reply with master status
+        prepareCommand(
+          BLIND_STATUS,
+          0, // blind_number 0 = master
+          actuator.getCoverState(),
+          actuator.readPositionPercent(),
+          actuator.readPositionRaw(),
+          actuator.getLastMoveStatus()
+        );
+      } else if (requested_blind > 0 && requested_blind <= MAX_SLAVES) {
+        slave_reading = true;
+        ensureVBATOn();
+        pollSlaveStatusUART(requested_blind);
+        slave_reading = false;
+        updateVBATState();
+      }
       break;
+    }
     case BLIND_COMMAND:
       LOG_INFO("BLIND COMMAND\r\n");
       blind_number = command.payload[0];
@@ -1538,7 +1556,7 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
     Radio.Standby();
     if (cadResult) {
       LOG_WARN("CAD returned channel busy %d times\r\r\n", cadRepeat);
-      if (cadRepeat < 6) {
+      if (cadRepeat < CAD_RETRY) {
         // Retry CAD
         Radio.SetCadParams(LORA_CAD_08_SYMBOL, LORA_SPREADING_FACTOR + 13, 10, LORA_CAD_ONLY, 150);
         Radio.StartCad();

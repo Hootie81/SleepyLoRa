@@ -11,7 +11,7 @@
 #define BATT_ALPHA 0.7
 #define EN_PWM_CHANNEL 0 // PWM channel for enable pin
 
-#define VBAT_BOOT_MS 1500   // Time to allow slaves to boot up before communicating with them
+#define VBAT_BOOT_MS 1800   // Time to allow slaves to boot up before communicating with them
 
 #define BATTERY_PIN 37
 #define BATTERY_ADC_PIN 01
