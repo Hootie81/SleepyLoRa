@@ -152,6 +152,15 @@ extern Ticker gatewayStatusTicker;
 std::map<std::pair<uint32_t, uint8_t>, unsigned long> blindLastSeen;
 Ticker blindAvailabilityTicker;
 
+struct BlindPollState {
+    unsigned long pollSentTime = 0;
+    bool awaitingResponse = false;
+};
+std::map<std::pair<uint32_t, uint8_t>, BlindPollState> blindPollStates;
+
+const unsigned long BLIND_OFFLINE_THRESHOLD = 600000UL; // 10 minutes
+const unsigned long BLIND_POLL_TIMEOUT = 15000UL; // 15 seconds
+
 // Track published discovery config for master devices
 std::set<uint32_t> publishedMasterDiscovery;
 
@@ -784,7 +793,8 @@ void decodePacket(void) {
 
     // Track last seen time for this blind
     blindLastSeen[std::make_pair(RXbuffer.first().nodeFromId, blind_number)] = millis();
-
+   // Reset poll state if we were polling
+    blindPollStates[std::make_pair(RXbuffer.first().nodeFromId, blind_number)].awaitingResponse = false;
     // State topic
     char stateTopic[64];
     snprintf(stateTopic, sizeof(stateTopic), "SleepyLoRa/%08X_%u/state", RXbuffer.first().nodeFromId, blind_number);
@@ -837,16 +847,45 @@ void decodePacket(void) {
 void checkBlindAvailability() {
     unsigned long now = millis();
     for (const auto& entry : blindLastSeen) {
-        uint32_t nodeId = entry.first.first;
-        uint8_t blindNum = entry.first.second;
+        auto key = entry.first;
         unsigned long lastSeen = entry.second;
-        if (now - lastSeen > 600000UL) { // 10 minutes
+        BlindPollState& pollState = blindPollStates[key];
+
+        Logger.log("DEBUG", "BLIND_AVAIL", "Checking blind %08X_%u: lastSeen=%lu, now=%lu, awaitingResponse=%d",
+                   key.first, key.second, lastSeen, now, (int)pollState.awaitingResponse);
+
+        // If not seen for threshold and not already polling, send poll
+        if ((now - lastSeen > BLIND_OFFLINE_THRESHOLD) && !pollState.awaitingResponse) {
+            Logger.log("INFO", "BLIND_AVAIL", "Blind %08X_%u not seen for %lu ms, sending poll",
+                       key.first, key.second, now - lastSeen);
+            if (!TXbuffer.isFull()) {
+                data::TXpacket pollPacket = {};
+                pollPacket.nodeToId = key.first;
+                pollPacket.command = BLIND_STATUS;
+                memset(pollPacket.payload, 0, sizeof(pollPacket.payload));
+                pollPacket.payload[0] = key.second; // Send blind number in payload[0]
+                TXbuffer.push(pollPacket);
+                pollState.pollSentTime = now;
+                pollState.awaitingResponse = true;
+                Serial.printf("Polling blind %08X_%u for availability\n", key.first, key.second);
+                Logger.log("DEBUG", "BLIND_AVAIL", "Poll packet queued for %08X_%u", key.first, key.second);
+            } else {
+                Logger.log("WARN", "BLIND_AVAIL", "TXbuffer full, cannot poll blind %08X_%u", key.first, key.second);
+            }
+        }
+
+        // If polling and timeout exceeded, mark as offline
+        if (pollState.awaitingResponse && (now - pollState.pollSentTime > BLIND_POLL_TIMEOUT)) {
             char availTopic[80];
-            snprintf(availTopic, sizeof(availTopic), "SleepyLoRa/%08X_%u/availability", nodeId, blindNum);
+            snprintf(availTopic, sizeof(availTopic), "SleepyLoRa/%08X_%u/availability", key.first, key.second);
             mqttClient.publish(availTopic, 0, true, "offline");
+            pollState.awaitingResponse = false; // Reset for next poll
+            Serial.printf("Blind %08X_%u marked offline (no response)\n", key.first, key.second);
+            Logger.log("INFO", "BLIND_AVAIL", "Blind %08X_%u marked offline after timeout", key.first, key.second);
         }
     }
 }
+
 /*****************************************************************************************************************
 
 Radio Setup, Sleep and Callbacks section
@@ -898,7 +937,9 @@ void radioSetup(void) {
 void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
   lastLoraRxTime = millis(); // Update RX time on every packet
   loraResetAttempts = 0;     // Reset attempts counter on successful RX
-
+  struct timeval tv_now;
+  gettimeofday(&tv_now, NULL);
+  Serial.printf("[%ld.%03ld] ", tv_now.tv_sec, tv_now.tv_usec / 1000);
   // Only copy if the size matches the expected struct size
   if (size != sizeof(tmploraRXpacket)) {
     Serial.println("Packet dropped, wrong size.. ");
@@ -926,6 +967,7 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
   memcpy(encrypted, tmploraRXpacket.dataEncrypted, sizeof(encrypted));
   aes128.decryptBlock(decrypted, encrypted);
   memcpy(&dataDEC, decrypted, sizeof(decrypted));
+
 
   // print decoded packet
   Serial.print("From NodeID: ");
