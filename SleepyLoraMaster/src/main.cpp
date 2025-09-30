@@ -711,9 +711,14 @@ void setup() {
     // Button held during power-on or config missing: start config portal
     LOG_INFO("AP and Webserver started\r\n");
     startConfigAPAndWebserver(actuator);
-    
+    configMode = true;
+    unsigned long configStartTime = millis();
     while (configMode) {
       delay(100);
+      if (millis() - configStartTime > 300000) { // 5 minutes timeout
+        LOG_WARN("Config portal timeout, going to sleep\r\n");
+        configMode = false;
+      }
     }
     goToSleep();
   }
